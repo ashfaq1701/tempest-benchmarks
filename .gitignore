@@ -6,3 +6,6 @@ data/*
 *.sif
 
 output.txt
+
+results/*
+!results/.gitkeep
