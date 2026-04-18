@@ -24,7 +24,7 @@ def human_readable_count(n):
         return str(n)
 
 
-def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu):
+def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu, kernel_mode):
     runtime_start = time.time()
 
     running_device = "GPU" if use_gpu else "CPU"
@@ -33,7 +33,7 @@ def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu
     t = Tempest(
         is_directed=True,
         use_gpu=use_gpu,
-        max_time_capacity=window_size,
+        max_time_capacity=window_size
     )
 
     edge_addition_times = []
@@ -74,6 +74,7 @@ def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu
             walk_bias=walk_bias,
             start_bias="Uniform",
             direction="Forward",
+            kernel_mode=kernel_mode
         )
         walk_sampling_time = time.time() - walk_start_time
         walk_times.append(walk_sampling_time)
@@ -136,6 +137,11 @@ if __name__ == "__main__":
         help='Walk bias type (default: ExponentialIndex)'
     )
 
+    parser.add_argument(
+        '--kernel_mode', type=str, default='NodeGrouped',
+        help='Kernel mode (default: NodeGrouped)'
+    )
+
     args = parser.parse_args()
 
     base_dir = os.environ.get('ALIBABA_DATASET_PATH')
@@ -146,6 +152,7 @@ if __name__ == "__main__":
     print(f"Use GPU: {args.use_gpu}")
     print(f"Window size: {args.window_size} ms")
     print(f"Walk bias: {args.walk_bias}")
+    print(f"Kernel mode: {args.kernel_mode}")
 
     main(
         base_dir,
@@ -154,4 +161,5 @@ if __name__ == "__main__":
         args.walk_count,
         args.walk_bias,
         args.use_gpu,
+        args.kernel_model
     )
