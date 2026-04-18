@@ -9,6 +9,7 @@ raphtory
 networkx
 gensim
 torch
+python-dotenv
 
 tempest-rw
 # temporal-negative-edge-sampler
