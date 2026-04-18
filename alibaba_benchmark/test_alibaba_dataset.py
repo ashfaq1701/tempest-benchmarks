@@ -161,5 +161,5 @@ if __name__ == "__main__":
         args.walk_count,
         args.walk_bias,
         args.use_gpu,
-        args.kernel_model
+        args.kernel_mode
     )
