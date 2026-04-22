@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from tempest import Tempest
+from temporal_random_walk import TemporalRandomWalk
 
 MAX_WALK_LEN = 100
 
@@ -24,13 +24,13 @@ def human_readable_count(n):
         return str(n)
 
 
-def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu, kernel_mode):
+def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use_gpu, kernel_launch_type):
     runtime_start = time.time()
 
     running_device = "GPU" if use_gpu else "CPU"
     print(f"---- Running on {running_device}. ----\n")
 
-    t = Tempest(
+    t = TemporalRandomWalk(
         is_directed=True,
         use_gpu=use_gpu,
         max_time_capacity=window_size
@@ -58,23 +58,23 @@ def main(base_dir, minutes_per_step, window_size, walk_count, walk_bias, use_gpu
         timestamps = final_df['ts'].astype(np.int64).values
 
         edge_addition_start_time = time.time()
-        t.add_edges(sources, targets, timestamps)
+        t.add_multiple_edges(sources, targets, timestamps)
         edge_addition_time = time.time() - edge_addition_start_time
 
         edge_addition_times.append(edge_addition_time)
 
-        active_edge_count = t.edge_count()
+        active_edge_count = t.get_edge_count()
         total_edges_per_iteration.append(total_edges_added)
         active_edges_per_iteration.append(active_edge_count)
 
         walk_start_time = time.time()
-        t.get_walks_global(
-            num_walks_total=walk_count,
+        t.get_random_walks_and_times_for_all_nodes(
             max_walk_len=MAX_WALK_LEN,
             walk_bias=walk_bias,
-            start_bias="Uniform",
-            direction="Forward",
-            kernel_mode=kernel_mode
+            num_walks_per_node=walks_per_node,
+            initial_edge_bias="Uniform",
+            walk_direction="Forward_In_Time",
+            kernel_launch_type=kernel_launch_type
         )
         walk_sampling_time = time.time() - walk_start_time
         walk_times.append(walk_sampling_time)
@@ -128,8 +128,8 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        '--walk_count', type=int, default=1_000_000,
-        help='Number of walks to generate (default: 1_000_000)'
+        '--walks_per_node', type=int, default=100,
+        help='Number of walks per node (default: 100)'
     )
 
     parser.add_argument(
@@ -138,8 +138,8 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        '--kernel_mode', type=str, default='NodeGrouped',
-        help='Kernel mode (default: NodeGrouped)'
+        '--kernel_launch_type', type=str, default='NODE_GROUPED',
+        help='Kernel launch type (default: NODE_GROUPED)'
     )
 
     args = parser.parse_args()
@@ -152,14 +152,14 @@ if __name__ == "__main__":
     print(f"Use GPU: {args.use_gpu}")
     print(f"Window size: {args.window_size} ms")
     print(f"Walk bias: {args.walk_bias}")
-    print(f"Kernel mode: {args.kernel_mode}")
+    print(f"Kernel launch type: {args.kernel_launch_type}")
 
     main(
         base_dir,
         args.minutes_per_step,
         args.window_size,
-        args.walk_count,
+        args.walks_per_node,
         args.walk_bias,
         args.use_gpu,
-        args.kernel_mode
+        args.kernel_launch_type
     )
