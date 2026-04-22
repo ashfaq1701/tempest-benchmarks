@@ -11,5 +11,5 @@ gensim
 torch
 python-dotenv
 
-temporal-random-walk >= 1.6.5
+temporal-random-walk >= 1.6.6
 # temporal-negative-edge-sampler
