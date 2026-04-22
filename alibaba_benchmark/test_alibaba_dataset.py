@@ -46,7 +46,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
 
     total_edges_added = 0
 
-    for i in range(0, 20160, minutes_per_step):
+    for i in range(0, 90, minutes_per_step):
         dfs = [pd.read_parquet(os.path.join(base_dir, f'data_{i + j}.parquet')) for j in range(minutes_per_step)]
         merged_df = pd.concat(dfs, ignore_index=True)
         final_df = merged_df.sample(frac=1, random_state=42).reset_index(drop=True)
@@ -68,7 +68,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
         active_edges_per_iteration.append(active_edge_count)
 
         walk_start_time = time.time()
-        t.get_random_walks_and_times_for_all_nodes(
+        walks, times, walk_lens, edge_features = t.get_random_walks_and_times_for_all_nodes(
             max_walk_len=MAX_WALK_LEN,
             walk_bias=walk_bias,
             num_walks_per_node=walks_per_node,
@@ -76,6 +76,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
             walk_direction="Forward_In_Time",
             kernel_launch_type=kernel_launch_type
         )
+
         walk_sampling_time = time.time() - walk_start_time
         walk_times.append(walk_sampling_time)
 
@@ -83,6 +84,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
         print(
             f"{total_minutes_data_processed} minutes data processed | "
             f"Edge addition time: {edge_addition_time:.3f}s | "
+            f"Walks sampled: {len(walk_lens)} | "
             f"Walk sampling time: {walk_sampling_time:.3f}s | "
             f"Total edges: {human_readable_count(total_edges_added)} | "
             f"Active edges: {human_readable_count(active_edge_count)}"
