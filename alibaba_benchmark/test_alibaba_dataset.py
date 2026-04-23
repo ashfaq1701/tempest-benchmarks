@@ -73,7 +73,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
             walk_bias=walk_bias,
             num_walks_per_node=walks_per_node,
             initial_edge_bias="Uniform",
-            walk_direction="BACKWARD_IN_TIME",
+            walk_direction="Backward_In_Time",
             kernel_launch_type=kernel_launch_type
         )
         walk_sampling_time = time.time() - walk_start_time
