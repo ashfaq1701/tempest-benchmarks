@@ -68,12 +68,12 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
         active_edges_per_iteration.append(active_edge_count)
 
         walk_start_time = time.time()
-        t.get_random_walks_and_times_for_all_nodes(
+        noes, times, walk_lens, edge_attrs = t.get_random_walks_and_times_for_all_nodes(
             max_walk_len=MAX_WALK_LEN,
             walk_bias=walk_bias,
             num_walks_per_node=walks_per_node,
             initial_edge_bias="Uniform",
-            walk_direction="Forward_In_Time",
+            walk_direction="BACKWARD_IN_TIME",
             kernel_launch_type=kernel_launch_type
         )
         walk_sampling_time = time.time() - walk_start_time
@@ -84,6 +84,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
             f"{total_minutes_data_processed} minutes data processed | "
             f"Edge addition time: {edge_addition_time:.3f}s | "
             f"Walk sampling time: {walk_sampling_time:.3f}s | "
+            f"Walk count: {len(walk_lens)} | "
             f"Total edges: {human_readable_count(total_edges_added)} | "
             f"Active edges: {human_readable_count(active_edge_count)}"
         )
