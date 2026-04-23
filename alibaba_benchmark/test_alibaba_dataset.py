@@ -46,7 +46,7 @@ def main(base_dir, minutes_per_step, window_size, walks_per_node, walk_bias, use
 
     total_edges_added = 0
 
-    for i in range(0, 20160, minutes_per_step):
+    for i in range(0, 60, minutes_per_step):
         dfs = [pd.read_parquet(os.path.join(base_dir, f'data_{i + j}.parquet')) for j in range(minutes_per_step)]
         merged_df = pd.concat(dfs, ignore_index=True)
         final_df = merged_df.sample(frac=1, random_state=42).reset_index(drop=True)
