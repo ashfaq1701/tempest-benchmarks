@@ -323,10 +323,11 @@ def main() -> int:
             ap.error(f'{name} CSV not found: {p}')
 
     out_base = Path(args.output)
-    out_tune  = out_base.parent / f'{out_base.name}_tuning.csv'
-    out_final = out_base.parent / f'{out_base.name}_final.csv'
-    nsys_dir  = Path(args.nsys_dir) if args.nsys_dir else \
-                out_base.parent / f'{out_base.name}_nsys'
+    out_tune   = out_base.parent / f'{out_base.name}_tuning.csv'
+    out_final  = out_base.parent / f'{out_base.name}_final.csv'
+    out_ingest = out_base.parent / f'{out_base.name}_ingest.csv'
+    nsys_dir   = Path(args.nsys_dir) if args.nsys_dir else \
+                 out_base.parent / f'{out_base.name}_nsys'
     nsys_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'# binary           : {args.binary}')
@@ -337,8 +338,9 @@ def main() -> int:
     print(f'# final thr runs   : {FINAL_RUNS_THR}  (per dataset × variant at winning W)')
     print(f'# nsys runs/cell   : {NSYS_RUNS_PER_CELL}')
     print(f'# outlier threshold: {OUTLIER_THRESHOLD:.0%} (min_keep={MIN_KEEP})')
-    print(f'# tuning CSV       : {out_tune}')
-    print(f'# final CSV        : {out_final}')
+    print(f'# tuning CSV       : {out_tune}    (one row per Phase-1 invocation)')
+    print(f'# final CSV        : {out_final}     (one row per dataset × variant)')
+    print(f'# ingest CSV       : {out_ingest}    (one row per dataset; variant-agnostic)')
     print(f'# nsys reports dir : {nsys_dir}')
     print()
 
@@ -641,8 +643,6 @@ def main() -> int:
         print('No successful tuning runs.', file=sys.stderr); return 1
     if not final_rows:
         print('No successful final runs.', file=sys.stderr); return 1
-
-    out_ingest = out_base.parent / f'{out_base.name}_ingest.csv'
 
     with out_tune.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(tuning_rows[0].keys()))
