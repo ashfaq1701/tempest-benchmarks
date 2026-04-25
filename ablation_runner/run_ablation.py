@@ -161,40 +161,103 @@ def export_to_sqlite(nsys_bin, rep_path):
     return sql_path
 
 
+def _extract_walk(db):
+    """Walk-side metrics from `walk_sampling_batch` NVTX ranges."""
+    ranges = db.execute(
+        "SELECT start, end FROM NVTX_EVENTS WHERE text = 'walk_sampling_batch' "
+        "ORDER BY start"
+    ).fetchall()
+    if not ranges:
+        return None
+    per_call = []
+    for s, e in ranges:
+        row = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(end - start), 0) "
+            "FROM CUPTI_ACTIVITY_KIND_KERNEL "
+            "WHERE start >= ? AND end <= ?", (s, e)
+        ).fetchone()
+        n_kern, t_kern_ns = row[0], row[1]
+        per_call.append((n_kern, t_kern_ns / 1e6, (e - s) / 1e6))
+    n_calls       = len(per_call)
+    total_kern_ms = sum(r[1] for r in per_call)
+    total_n_kern  = sum(r[0] for r in per_call)
+    total_nvtx_ms = sum(r[2] for r in per_call)
+    return {
+        'kern_time_per_call_ms':  total_kern_ms / n_calls,
+        'kern_launches_per_call': total_n_kern / n_calls,
+        'per_kernel_us':          (total_kern_ms / max(1, total_n_kern)) * 1000.0,
+        'gpu_active_frac':        total_kern_ms / total_nvtx_ms if total_nvtx_ms else 0.0,
+    }
+
+
+def _extract_ingest(db):
+    """Ingest-side metrics from `ingestion_batch` NVTX ranges. Returns
+    None if the binary did not emit ingestion NVTX (e.g., walk-only run).
+
+    Bucket criteria (substring match on resolved kernel name):
+      - sort+merge :   `RadixSort` or `merge_kernel`
+      - weight     :   `compute_per_node_weights`
+    H2D bytes/duration come from CUPTI_ACTIVITY_KIND_MEMCPY with
+    copyKind = 1 (Host-to-Device).
+    """
+    ranges = db.execute(
+        "SELECT start, end FROM NVTX_EVENTS WHERE text = 'ingestion_batch' "
+        "ORDER BY start"
+    ).fetchall()
+    if not ranges:
+        return None
+    per_call = []
+    for s, e in ranges:
+        nvtx_ms = (e - s) / 1e6
+        kerns = db.execute("""
+            SELECT k.start, k.end,
+                   COALESCE(d.value, m.value, sn.value, '') AS name
+            FROM CUPTI_ACTIVITY_KIND_KERNEL k
+            LEFT JOIN StringIds d  ON d.id  = k.demangledName
+            LEFT JOIN StringIds m  ON m.id  = k.mangledName
+            LEFT JOIN StringIds sn ON sn.id = k.shortName
+            WHERE k.start >= ? AND k.end <= ?
+        """, (s, e)).fetchall()
+        n_launches    = len(kerns)
+        sort_ms       = sum((k[1] - k[0]) for k in kerns
+                            if 'RadixSort' in k[2] or 'merge_kernel' in k[2]) / 1e6
+        weight_ms     = sum((k[1] - k[0]) for k in kerns
+                            if 'compute_per_node_weights' in k[2]) / 1e6
+        h2d_ms = (db.execute(
+            "SELECT COALESCE(SUM(end - start), 0) "
+            "FROM CUPTI_ACTIVITY_KIND_MEMCPY "
+            "WHERE start >= ? AND end <= ? AND copyKind = 1", (s, e)
+        ).fetchone()[0]) / 1e6
+        per_call.append({
+            'total_ms':  nvtx_ms,
+            'sort_ms':   sort_ms,
+            'weight_ms': weight_ms,
+            'h2d_ms':    h2d_ms,
+            'launches':  n_launches,
+        })
+    n = len(per_call)
+    return {
+        'ingest_total_ms':  sum(c['total_ms']  for c in per_call) / n,
+        'ingest_sort_ms':   sum(c['sort_ms']   for c in per_call) / n,
+        'ingest_weight_ms': sum(c['weight_ms'] for c in per_call) / n,
+        'ingest_h2d_ms':    sum(c['h2d_ms']    for c in per_call) / n,
+        'ingest_launches':  sum(c['launches']  for c in per_call) / n,
+    }
+
+
 def extract_nsys_metrics(nsys_bin, rep_path):
-    """Query the SQLite export for activity inside `walk_sampling_batch`
-    NVTX ranges and compute the four diagnostic metrics. Returns dict or
-    raises if no NVTX ranges found."""
+    """Returns (walk_dict, ingest_dict). Either may be None if the
+    corresponding NVTX range is absent. Raises only if the SQLite export
+    itself fails or yields no kernel timeline."""
     sql_path = export_to_sqlite(nsys_bin, rep_path)
     db = sqlite3.connect(sql_path)
     try:
-        ranges = db.execute(
-            "SELECT start, end FROM NVTX_EVENTS WHERE text = 'walk_sampling_batch' "
-            "ORDER BY start"
-        ).fetchall()
-        if not ranges:
-            raise RuntimeError(f'no walk_sampling_batch NVTX ranges in {rep_path}')
-        per_call = []
-        for s, e in ranges:
-            row = db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(end - start), 0) "
-                "FROM CUPTI_ACTIVITY_KIND_KERNEL "
-                "WHERE start >= ? AND end <= ?", (s, e)
-            ).fetchone()
-            n_kern, t_kern_ns = row[0], row[1]
-            nvtx_ms = (e - s) / 1e6
-            kern_ms = t_kern_ns / 1e6
-            per_call.append((n_kern, kern_ms, nvtx_ms))
-        n_calls = len(per_call)
-        total_kern_ms = sum(r[1] for r in per_call)
-        total_n_kern  = sum(r[0] for r in per_call)
-        total_nvtx_ms = sum(r[2] for r in per_call)
-        return {
-            'kern_time_per_call_ms':  total_kern_ms / n_calls,
-            'kern_launches_per_call': total_n_kern / n_calls,
-            'per_kernel_us':          (total_kern_ms / max(1, total_n_kern)) * 1000.0,
-            'gpu_active_frac':        total_kern_ms / total_nvtx_ms if total_nvtx_ms else 0.0,
-        }
+        walk = _extract_walk(db)
+        ingest = _extract_ingest(db)
+        if walk is None and ingest is None:
+            raise RuntimeError(
+                f'no walk_sampling_batch or ingestion_batch NVTX in {rep_path}')
+        return walk, ingest
     finally:
         db.close()
 
@@ -457,6 +520,10 @@ def main() -> int:
     print()
 
     nsys_stats: dict = {}
+    # Ingest is variant-agnostic (add_multiple_edges is the same path across
+    # all three KernelLaunchTypes). Pool every nsys run for a given dataset.
+    ingest_pool: dict = {ds: {'total': [], 'sort': [], 'weight': [],
+                              'h2d':   [], 'launches': []} for ds in DATASETS}
     for ds in DATASETS:
         wpn, nb, nw, mwl = PRESETS[ds]
         for variant in ALL_VARIANTS:
@@ -469,17 +536,31 @@ def main() -> int:
                 try:
                     invoke_nsys(args.nsys, rep, args.binary, paths[ds], variant,
                                 wpn, nb, nw, mwl, args.block_dim, w)
-                    m = extract_nsys_metrics(args.nsys, rep)
+                    walk, ingest = extract_nsys_metrics(args.nsys, rep)
                 except RuntimeError as e:
                     print(f'FAIL ({e})', file=sys.stderr); continue
-                kt.append(m['kern_time_per_call_ms'])
-                kn.append(m['kern_launches_per_call'])
-                pk.append(m['per_kernel_us'])
-                gf.append(m['gpu_active_frac'])
-                print(f'kern_t={m["kern_time_per_call_ms"]:7.2f}ms  '
-                      f'launches={m["kern_launches_per_call"]:7.1f}  '
-                      f'kern_us={m["per_kernel_us"]:8.2f}  '
-                      f'active={m["gpu_active_frac"]:.3f}')
+                if walk is not None:
+                    kt.append(walk['kern_time_per_call_ms'])
+                    kn.append(walk['kern_launches_per_call'])
+                    pk.append(walk['per_kernel_us'])
+                    gf.append(walk['gpu_active_frac'])
+                if ingest is not None:
+                    ingest_pool[ds]['total'   ].append(ingest['ingest_total_ms'])
+                    ingest_pool[ds]['sort'    ].append(ingest['ingest_sort_ms'])
+                    ingest_pool[ds]['weight'  ].append(ingest['ingest_weight_ms'])
+                    ingest_pool[ds]['h2d'     ].append(ingest['ingest_h2d_ms'])
+                    ingest_pool[ds]['launches'].append(ingest['ingest_launches'])
+                line = ''
+                if walk is not None:
+                    line += (f'kern_t={walk["kern_time_per_call_ms"]:7.2f}ms  '
+                             f'launches={walk["kern_launches_per_call"]:7.1f}  '
+                             f'kern_us={walk["per_kernel_us"]:8.2f}  '
+                             f'active={walk["gpu_active_frac"]:.3f}')
+                if ingest is not None:
+                    line += (f'  || ing_t={ingest["ingest_total_ms"]:6.1f}ms  '
+                             f'sort={ingest["ingest_sort_ms"]:5.1f}ms  '
+                             f'wgt={ingest["ingest_weight_ms"]:5.1f}ms')
+                print(line)
             kept_kt, dr_kt = reject_outliers(kt)
             kept_kn, dr_kn = reject_outliers(kn)
             kept_pk, dr_pk = reject_outliers(pk)
@@ -516,6 +597,43 @@ def main() -> int:
             row.update(ts); row.update(ns)
             final_rows.append(row)
 
+    # Aggregate ingest pool per dataset (variant-agnostic — same code path).
+    # Outlier rejection per metric independently. n_samples = up to
+    # NSYS_RUNS_PER_CELL × len(ALL_VARIANTS).
+    ingest_rows = []
+    for ds in DATASETS:
+        pool = ingest_pool.get(ds, {})
+        if not pool or not pool.get('total'):
+            continue
+        kept = {}
+        for k in ('total', 'sort', 'weight', 'h2d', 'launches'):
+            kept_k, dropped_k = reject_outliers(pool[k])
+            kept[k] = kept_k
+            if dropped_k:
+                msg = fmt_drop(f'ingest_{k}', dropped_k, len(kept_k),
+                               len(pool[k]), scale=1.0,
+                               unit='ms' if k != 'launches' else '')
+                if msg: print(msg)
+        tot_m, tot_s = mean_std(kept['total'])
+        srt_m, srt_s = mean_std(kept['sort'])
+        wgt_m, wgt_s = mean_std(kept['weight'])
+        h2d_m, h2d_s = mean_std(kept['h2d'])
+        lau_m, lau_s = mean_std(kept['launches'])
+        ingest_rows.append({
+            'dataset':                  ds,
+            'n_samples_raw':            len(pool['total']),
+            'n_samples_kept_total':     len(kept['total']),
+            'ingest_total_ms_mean':     tot_m, 'ingest_total_ms_std':     tot_s,
+            'ingest_sort_ms_mean':      srt_m, 'ingest_sort_ms_std':      srt_s,
+            'ingest_weight_ms_mean':    wgt_m, 'ingest_weight_ms_std':    wgt_s,
+            'ingest_h2d_ms_mean':       h2d_m, 'ingest_h2d_ms_std':       h2d_s,
+            'ingest_launches_mean':     lau_m, 'ingest_launches_std':     lau_s,
+            # Convenience derived columns (% of total ingest wall time):
+            'ingest_sort_frac':         srt_m / tot_m if tot_m else 0.0,
+            'ingest_weight_frac':       wgt_m / tot_m if tot_m else 0.0,
+            'ingest_h2d_frac':          h2d_m / tot_m if tot_m else 0.0,
+        })
+
     # ===========================================================
     # Persist CSVs.
     # ===========================================================
@@ -523,6 +641,8 @@ def main() -> int:
         print('No successful tuning runs.', file=sys.stderr); return 1
     if not final_rows:
         print('No successful final runs.', file=sys.stderr); return 1
+
+    out_ingest = out_base.parent / f'{out_base.name}_ingest.csv'
 
     with out_tune.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(tuning_rows[0].keys()))
@@ -536,10 +656,16 @@ def main() -> int:
                     fieldnames.append(k); seen.add(k)
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader(); writer.writerows(final_rows)
+    if ingest_rows:
+        with out_ingest.open('w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(ingest_rows[0].keys()))
+            writer.writeheader(); writer.writerows(ingest_rows)
 
     print()
     print(f'Wrote {len(tuning_rows)} tuning rows to {out_tune}')
     print(f'Wrote {len(final_rows)} final rows to {out_final}')
+    if ingest_rows:
+        print(f'Wrote {len(ingest_rows)} ingest rows to {out_ingest}')
     print()
 
     # ===========================================================
@@ -575,6 +701,32 @@ def main() -> int:
               f'{r.get("per_kernel_us_std", 0):>7.2f} | '
               f'{r.get("gpu_active_frac_mean", 0):>10.3f} | '
               f'{r.get("gpu_active_frac_std", 0):>7.3f} |')
+
+    # Ingest report — one row per dataset, pooling all variants × runs.
+    if ingest_rows:
+        print()
+        print('=' * 70)
+        print('Ingest report — variant-agnostic; pooled across all Phase 3 runs')
+        print('=' * 70)
+        print()
+        print(f'| {"dataset":<9} | {"n":>3} | '
+              f'{"total ms":>10} | {"std":>7} | '
+              f'{"sort ms":>9} | {"std":>7} | {"sort %":>6} | '
+              f'{"weight ms":>10} | {"std":>7} | {"weight %":>8} | '
+              f'{"H2D ms":>8} | {"std":>7} | {"H2D %":>6} | '
+              f'{"launches":>8} | {"std":>7} |')
+        print('|' + '|'.join('-' * w for w in
+              [11, 5, 12, 9, 11, 9, 8, 12, 9, 10, 10, 9, 8, 10, 9]) + '|')
+        for r in ingest_rows:
+            print(f'| {r["dataset"]:<9} | {r["n_samples_kept_total"]:>3} | '
+                  f'{r["ingest_total_ms_mean"]:>10.2f} | {r["ingest_total_ms_std"]:>7.2f} | '
+                  f'{r["ingest_sort_ms_mean"]:>9.2f} | {r["ingest_sort_ms_std"]:>7.2f} | '
+                  f'{r["ingest_sort_frac"]*100:>5.1f}% | '
+                  f'{r["ingest_weight_ms_mean"]:>10.2f} | {r["ingest_weight_ms_std"]:>7.2f} | '
+                  f'{r["ingest_weight_frac"]*100:>7.1f}% | '
+                  f'{r["ingest_h2d_ms_mean"]:>8.2f} | {r["ingest_h2d_ms_std"]:>7.2f} | '
+                  f'{r["ingest_h2d_frac"]*100:>5.1f}% | '
+                  f'{r["ingest_launches_mean"]:>8.1f} | {r["ingest_launches_std"]:>7.1f} |')
     return 0
 
 
