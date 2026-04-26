@@ -194,27 +194,49 @@ def invoke_nsys(nsys_bin, rep_path, binary, data, klt, wpn, nb, nw, mwl,
 
 def export_and_validate(nsys_bin, rep_path):
     """Force a fresh `nsys export -t sqlite` and verify the result has
-    the expected tables. Raises on bad rep / bad export."""
+    the expected tables. Raises on bad rep / bad export.
+
+    Without --output, nsys 2024.4.2 (HPC toolkit at /its/home/ms2420/
+    cuda-12.6/bin/) silently writes the sqlite to the *current working
+    directory* with the rep's basename — not next to the .nsys-rep as
+    older versions did. Pass --output explicitly to pin the location;
+    add a basename-search fallback so we still recover even when a
+    weirder version writes it somewhere else."""
     rep_path = Path(rep_path)
     if not rep_path.exists():
         raise RuntimeError(f'.nsys-rep not found: {rep_path}')
     sql_path = rep_path.with_suffix('.sqlite')
-    # Always nuke any existing sqlite — the mtime-cache logic in
-    # run_ablation.py was unsafe; nsys export can return 0 without
-    # actually rewriting the file. Force a clean re-export every time.
     if sql_path.exists():
         sql_path.unlink()
+
     proc = subprocess.run(
         [nsys_bin, 'export', '-t', 'sqlite',
-         '--force-overwrite=true', str(rep_path)],
+         '--force-overwrite=true',
+         '--output', str(sql_path),
+         str(rep_path)],
         capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f'nsys export exit {proc.returncode}. stderr tail:\n'
             f'{proc.stderr[-500:]}')
+
+    # Defensive fallback: if nsys still parked the file elsewhere
+    # (.sqlite.sqlite from double-extension append, or cwd from a
+    # version that ignores --output), find and move it.
+    if not sql_path.exists():
+        for alt in (
+            sql_path.with_suffix('.sqlite.sqlite'),
+            Path.cwd() / sql_path.name,
+            Path.cwd() / sql_path.with_suffix('.sqlite.sqlite').name,
+        ):
+            if alt.exists():
+                alt.rename(sql_path)
+                break
+
     if not sql_path.exists():
         raise RuntimeError(
             f'nsys export returned 0 but {sql_path} was not produced. '
+            f'Searched fallbacks: <rep>.sqlite.sqlite, cwd. '
             f'stderr tail:\n{proc.stderr[-500:]}')
     # Verify the export actually wrote the schema we depend on.
     db = sqlite3.connect(sql_path)
