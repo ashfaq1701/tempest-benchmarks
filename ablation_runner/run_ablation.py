@@ -86,9 +86,9 @@ NOISE_BAND           = 0.01
 # older half of every batch is ingested then immediately expired before
 # the walk call (wasted ingest, no walk samples on those edges).
 PRESETS = {
-    'coin':      (20,  5,  3, 80),
-    'flight':    (20,  5,  3, 80),
     'delicious': ( 5, 50, 20, 20),
+    'coin':      (20,  5,  3, 80),
+    'flight':    (20,  5,  3, 80)
 }
 
 USE_GPU     = '1'
