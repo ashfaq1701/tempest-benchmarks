@@ -161,10 +161,34 @@ def export_to_sqlite(nsys_bin, rep_path):
     return sql_path
 
 
+_NVTX_TABLE_CANDIDATES = (
+    'NVTX_EVENTS',          # nsys <= 2024.x (and most current Linux installs)
+    'NVTX_PUSHPOP_EVENTS',  # newer nsys schema variant
+    'NSYS_EVENTS_NVTX_PUSHPOP',
+)
+
+
+def _find_nvtx_table(db):
+    """Return whichever NVTX-events table the SQLite export contains.
+    nsys versions differ in table naming. Raises if none is found."""
+    rows = db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    have = {r[0] for r in rows}
+    for c in _NVTX_TABLE_CANDIDATES:
+        if c in have:
+            return c
+    nvtx_like = sorted(t for t in have if 'NVTX' in t.upper())
+    raise RuntimeError(
+        'no NVTX events table in SQLite export — checked '
+        f'{list(_NVTX_TABLE_CANDIDATES)}. Tables matching NVTX: '
+        f'{nvtx_like or "(none)"}. Confirm nsys was invoked with '
+        '`--trace=cuda,nvtx` and that the binary links libnvToolsExt.')
+
+
 def _extract_walk(db):
     """Walk-side metrics from `walk_sampling_batch` NVTX ranges."""
+    nvtx_tbl = _find_nvtx_table(db)
     ranges = db.execute(
-        "SELECT start, end FROM NVTX_EVENTS WHERE text = 'walk_sampling_batch' "
+        f"SELECT start, end FROM {nvtx_tbl} WHERE text = 'walk_sampling_batch' "
         "ORDER BY start"
     ).fetchall()
     if not ranges:
@@ -200,8 +224,9 @@ def _extract_ingest(db):
     H2D bytes/duration come from CUPTI_ACTIVITY_KIND_MEMCPY with
     copyKind = 1 (Host-to-Device).
     """
+    nvtx_tbl = _find_nvtx_table(db)
     ranges = db.execute(
-        "SELECT start, end FROM NVTX_EVENTS WHERE text = 'ingestion_batch' "
+        f"SELECT start, end FROM {nvtx_tbl} WHERE text = 'ingestion_batch' "
         "ORDER BY start"
     ).fetchall()
     if not ranges:
@@ -292,6 +317,21 @@ def fmt_drop(label, dropped, kept_n, raw_n, scale=1.0, unit=''):
         return None
     s = ', '.join(f'{d/scale:.3f}{unit}' for d in dropped)
     return f'    [{len(dropped)} outlier(s) rejected ({label}): {s}; kept {kept_n}/{raw_n}]'
+
+
+def write_csv(path, rows):
+    """Write a list-of-dicts to CSV. Field order = union of keys across
+    rows in insertion order. Idempotent — overwrites if file exists."""
+    if not rows:
+        return
+    fieldnames, seen = [], set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                fieldnames.append(k); seen.add(k)
+    with path.open('w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader(); w.writerows(rows)
 
 
 def main() -> int:
@@ -465,6 +505,12 @@ def main() -> int:
     cell_w = {(ds, v): (winning_w if v in NG_VARIANTS else 1)
               for ds in DATASETS for v in ALL_VARIANTS}
 
+    # Persist tuning CSV NOW. Phase 1 typically takes the longest; if any
+    # later phase explodes, we must not lose this data.
+    write_csv(out_tune, tuning_rows)
+    print(f'(checkpoint) wrote {len(tuning_rows)} tuning rows to {out_tune}')
+    print()
+
     # ===========================================================
     # Phase 2: throughput finals — FINAL_RUNS_THR per (dataset, variant).
     # ===========================================================
@@ -512,6 +558,24 @@ def main() -> int:
                 'avg_walk_length_mean': lm,
             }
 
+    # Persist throughput-only finals NOW. Phase 3 may fail (nsys version
+    # mismatch, sqlite schema differences, profiling overhead crashes);
+    # don't lose Phase 2 work to a Phase 3 explosion.
+    thr_only_rows = []
+    for ds in DATASETS:
+        for variant in ALL_VARIANTS:
+            ts = thr_stats.get((ds, variant), {})
+            if not ts:
+                continue
+            row = {'dataset': ds, 'variant': variant,
+                   'w_threshold_warp': ts.get('w', 1)}
+            row.update(ts)
+            thr_only_rows.append(row)
+    write_csv(out_final, thr_only_rows)
+    print()
+    print(f'(checkpoint) wrote {len(thr_only_rows)} throughput-only rows to '
+          f'{out_final} (Phase 3 will overwrite with nsys columns added)')
+
     # ===========================================================
     # Phase 3: nsys-driven kernel/NVTX metrics.
     # ===========================================================
@@ -539,8 +603,12 @@ def main() -> int:
                     invoke_nsys(args.nsys, rep, args.binary, paths[ds], variant,
                                 wpn, nb, nw, mwl, args.block_dim, w)
                     walk, ingest = extract_nsys_metrics(args.nsys, rep)
-                except RuntimeError as e:
-                    print(f'FAIL ({e})', file=sys.stderr); continue
+                except Exception as e:
+                    # Catch ALL — including sqlite3.OperationalError for
+                    # nsys-version schema mismatches. One bad rep skips the
+                    # rep, not the run; checkpointed CSVs are already on disk.
+                    print(f'FAIL ({type(e).__name__}: {e})', file=sys.stderr)
+                    continue
                 if walk is not None:
                     kt.append(walk['kern_time_per_call_ms'])
                     kn.append(walk['kern_launches_per_call'])
@@ -637,29 +705,18 @@ def main() -> int:
         })
 
     # ===========================================================
-    # Persist CSVs.
+    # Final CSV writes (overwrite the Phase 2 throughput-only checkpoint
+    # with the merged Phase 2 + Phase 3 row, and write the ingest CSV).
     # ===========================================================
     if not tuning_rows:
         print('No successful tuning runs.', file=sys.stderr); return 1
     if not final_rows:
         print('No successful final runs.', file=sys.stderr); return 1
 
-    with out_tune.open('w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(tuning_rows[0].keys()))
-        writer.writeheader(); writer.writerows(tuning_rows)
-    with out_final.open('w', newline='') as f:
-        # union of keys across rows (some cells may be missing if a phase failed)
-        fieldnames, seen = [], set()
-        for r in final_rows:
-            for k in r.keys():
-                if k not in seen:
-                    fieldnames.append(k); seen.add(k)
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader(); writer.writerows(final_rows)
+    write_csv(out_tune, tuning_rows)
+    write_csv(out_final, final_rows)
     if ingest_rows:
-        with out_ingest.open('w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=list(ingest_rows[0].keys()))
-            writer.writeheader(); writer.writerows(ingest_rows)
+        write_csv(out_ingest, ingest_rows)
 
     print()
     print(f'Wrote {len(tuning_rows)} tuning rows to {out_tune}')
