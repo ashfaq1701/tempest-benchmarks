@@ -88,7 +88,7 @@ NOISE_BAND           = 0.01
 PRESETS = {
     'coin':      (20,  5,  3, 80),
     'flight':    (20,  5,  3, 80),
-    'delicious': ( 1, 50, 20, 20),
+    'delicious': ( 5, 50, 20, 20),
 }
 
 USE_GPU     = '1'
