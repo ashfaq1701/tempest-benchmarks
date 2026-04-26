@@ -73,9 +73,11 @@ NSYS_RUNS_PER_CELL   = 3
 # Outlier rejection: from N samples, drop the value(s) whose deviation from
 # the (current) median exceeds OUTLIER_THRESHOLD * median, iteratively.
 # Stops when worst remaining is within threshold OR len(kept) == MIN_KEEP.
-# 0.20 catches the obvious 50%+ flukes (e.g. 4.8 vs cluster ~12) and the
-# moderate ~25% dips, while preserving normal 5% run-to-run noise.
-OUTLIER_THRESHOLD    = 0.20
+# 0.15 catches the obvious 50%+ flukes (e.g. 4.8 vs cluster ~12), the
+# moderate ~25% dips, AND the borderline ~15-20% server-contention dips
+# (e.g. 47 vs cluster ~55) — while still preserving normal 5% run-to-run
+# noise (5% << 15%).
+OUTLIER_THRESHOLD    = 0.15
 MIN_KEEP             = 3
 # Aggregate-W tie-break band. If multiple Ws are within NOISE_BAND of the
 # absolute best aggregate score, the smallest W wins (most conservative).
