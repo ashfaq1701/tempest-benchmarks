@@ -179,8 +179,16 @@ def cell_w(variant: str) -> int:
 
 def invoke_nsys(nsys_bin, rep_path, binary, data, klt, wpn, nb, nw, mwl,
                 block_dim, w_threshold_warp):
-    """Run binary under `nsys profile`. Output overwrites rep_path."""
-    cmd = [nsys_bin, 'profile', '--trace=cuda,nvtx',
+    """Run binary under `nsys profile --stats=true`. With --stats=true,
+    nsys writes the .sqlite NEXT TO the .nsys-rep as part of the profile
+    run — no separate `nsys export` step needed. This sidesteps a bug in
+    nsys 2024.4.2 (HPC toolkit at /its/home/ms2420/cuda-12.6/bin/) where
+    `nsys export` on a --stats=false rep returns exit 0 but writes a
+    sqlite with zero tables. Confirmed by side-by-side: a manually
+    re-profiled run with --stats=true produces a populated sqlite, while
+    the script's old profile-without-stats + separate-export produced
+    an empty one for the SAME workload."""
+    cmd = [nsys_bin, 'profile', '--trace=cuda,nvtx', '--stats=true',
            '--force-overwrite=true', '--output', str(rep_path)] + \
           build_run_argv(binary, data, klt, wpn, nb, nw, mwl,
                          block_dim, w_threshold_warp)
@@ -192,93 +200,37 @@ def invoke_nsys(nsys_bin, rep_path, binary, data, klt, wpn, nb, nw, mwl,
     return parse_throughput(proc.stdout)
 
 
-def export_and_validate(nsys_bin, rep_path):
-    """Force a fresh `nsys export -t sqlite` and verify the result has
-    the expected tables. Raises on bad rep / bad export.
-
-    nsys versions vary in --output handling (some honor it, some ignore
-    it and write to cwd, some append .sqlite to the value, some don't).
-    Strategy: try a sequence of invocations until one of them produces
-    a file at a path we can find, then move it to the canonical
-    `<rep>.sqlite` location. On total failure, print a wide diagnostic
-    listing every fresh .sqlite found anywhere on common search paths.
-    """
-    import time
+def validate_sqlite(rep_path):
+    """The .sqlite is produced as a side effect of `nsys profile
+    --stats=true` (see invoke_nsys). This function just verifies the
+    file exists and has the schema we depend on — no separate export
+    step. Raises on bad sqlite (missing or schema-incomplete)."""
     rep_path = Path(rep_path).resolve()
-    if not rep_path.exists():
-        raise RuntimeError(f'.nsys-rep not found: {rep_path}')
     sql_path = rep_path.with_suffix('.sqlite')
-    if sql_path.exists():
-        sql_path.unlink()
-
-    pre_time = time.time() - 2  # 2s buffer for clock skew / fs flush
-
-    # Try (a) no --output (older nsys default = next to rep), (b)
-    # --output with .sqlite suffix, (c) --output without extension
-    # (some versions append .sqlite). First one whose output we can
-    # find wins.
-    attempts = [
-        # (description, argv list)
-        ('no --output (default location)',
-         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
-          str(rep_path)]),
-        ('--output with .sqlite',
-         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
-          '--output', str(sql_path), str(rep_path)]),
-        ('--output without extension',
-         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
-          '--output', str(sql_path.with_suffix('')), str(rep_path)]),
-    ]
-
-    last_proc = None
-    last_cmd  = None
-    for desc, cmd in attempts:
-        last_cmd = cmd
-        last_proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if last_proc.returncode != 0:
-            continue  # try next attempt
-        # Search likely landing spots for a fresh sqlite.
-        candidates = [
-            sql_path,
-            sql_path.with_suffix('.sqlite.sqlite'),
-            Path.cwd() / sql_path.name,
-            Path.cwd() / (sql_path.stem + '.sqlite'),
-            Path.cwd() / sql_path.with_suffix('.sqlite.sqlite').name,
-        ]
-        found = None
-        for c in candidates:
-            try:
-                if c.exists() and c.stat().st_mtime >= pre_time and c.stat().st_size > 0:
-                    found = c
-                    break
-            except (FileNotFoundError, PermissionError):
-                pass
-        if found is not None:
-            if found != sql_path:
-                found.rename(sql_path)
-            break
-    else:
-        # All attempts ran but none produced a findable file.
-        recent = []
-        for d in (Path.cwd(), rep_path.parent, Path('/tmp')):
-            try:
-                for p in d.glob('*.sqlite'):
-                    if p.stat().st_mtime >= pre_time:
-                        recent.append(f'{p} ({p.stat().st_size} bytes)')
-            except (FileNotFoundError, PermissionError):
-                pass
-        raise RuntimeError(
-            f'nsys export produced no findable .sqlite for {rep_path}.\n'
-            f'last cmd: {" ".join(last_cmd or [])}\n'
-            f'last exit: {last_proc.returncode if last_proc else "—"}\n'
-            f'fresh .sqlite anywhere: {recent or "(none)"}\n'
-            f'stdout tail:\n{(last_proc.stdout if last_proc else "")[-300:]}\n'
-            f'stderr tail:\n{(last_proc.stderr if last_proc else "")[-300:]}')
-
     if not sql_path.exists():
         raise RuntimeError(
-            f'export attempted but {sql_path} still missing after rename. '
-            f'last cmd: {" ".join(last_cmd or [])}')
+            f'sqlite not found at {sql_path}. The .nsys-rep was likely '
+            f'profiled without --stats=true (e.g. via run_ablation.py '
+            f'before this fix), so the sqlite was never produced. '
+            f'Re-profile (drop --reuse-existing) to fix.')
+    if sql_path.stat().st_size == 0:
+        raise RuntimeError(f'sqlite exists but is empty: {sql_path}')
+    db = sqlite3.connect(sql_path)
+    try:
+        rows = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        names = {r[0] for r in rows}
+        missing = [t for t in ('CUPTI_ACTIVITY_KIND_KERNEL', 'NVTX_EVENTS')
+                   if t not in names]
+        if missing:
+            raise RuntimeError(
+                f'sqlite at {sql_path} missing required tables: {missing}. '
+                f'Total tables: {len(names)}. The rep was likely profiled '
+                f'without --stats=true; re-profile to fix.')
+    finally:
+        db.close()
+    return sql_path
     # Verify the export actually wrote the schema we depend on.
     db = sqlite3.connect(sql_path)
     try:
@@ -299,10 +251,11 @@ def export_and_validate(nsys_bin, rep_path):
     return sql_path
 
 
-def extract_metrics(nsys_bin, rep_path):
-    """Force a clean export, then run both extractors. Either may
-    return None; raises if both fail."""
-    sql_path = export_and_validate(nsys_bin, rep_path)
+def extract_metrics(rep_path):
+    """Validate the .sqlite (created by `nsys profile --stats=true`)
+    and run both extractors. Either may return None; raises if both
+    fail or if the sqlite is missing/incomplete."""
+    sql_path = validate_sqlite(rep_path)
     db = sqlite3.connect(sql_path)
     try:
         try:
@@ -412,7 +365,7 @@ def main() -> int:
                         invoke_nsys(args.nsys, rep, args.binary, paths[ds],
                                     variant, wpn, nb, nw, mwl,
                                     args.block_dim, w)
-                    walk, ingest = extract_metrics(args.nsys, rep)
+                    walk, ingest = extract_metrics(rep)
                 except Exception as e:
                     print(f'FAIL ({type(e).__name__}: {e})', file=sys.stderr)
                     continue
