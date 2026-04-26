@@ -53,7 +53,7 @@ from pathlib import Path
 
 ALL_VARIANTS = ['full_walk', 'node_grouped', 'node_grouped_global_only']
 NG_VARIANTS  = ['node_grouped', 'node_grouped_global_only']
-DATASETS     = ('coin', 'flight', 'delicious')
+DATASETS     = ('delicious', 'coin', 'flight')
 
 DEFAULT_BIN          = './build/bin/ablation_streaming'
 DEFAULT_OUTPUT_BASE  = 'ablation_results'
