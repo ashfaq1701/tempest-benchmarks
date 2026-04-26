@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 """
-Phase-3-only runner: nsys profiling + metric extraction at a hardcoded
-winning W. Use this when run_ablation.py has already completed Phase 1
-(tuning) and Phase 2 (throughput) and produced:
-  - <base>_tuning.csv
-  - <base>_final.csv   (throughput-only columns)
-…and you only need to (re)do the nsys phase. Saves ~6-12 hours by not
-redoing Phase 1+2.
+Profiling runner: nsys-based kernel/NVTX metric extraction at a hardcoded
+winning W. Use this AFTER run_ablation.py has produced:
+  - <base>_tuning.csv  (Phase 1 — W sweep)
+  - <base>_final.csv   (Phase 2 — throughput stats)
 
-This script:
+This script does the nsys-derived profiling step on top of those CSVs:
+
   1. Profiles each (dataset, variant) NSYS_RUNS_PER_CELL times, OR
      reuses existing <nsys_dir>/<dataset>_<variant>_run<r>.nsys-rep
      files if --reuse-existing is set.
-  2. Forces a fresh nsys export to .sqlite (the mtime-cache shortcut
-     in run_ablation.py turned out to swallow corrupted exports —
-     this script always overwrites and validates).
+  2. Forces a fresh nsys export to .sqlite every time (no mtime cache —
+     nsys can return exit 0 with no actual sqlite write, and a stale
+     empty file would silently break downstream queries).
   3. Validates the sqlite has the expected tables before running
      queries; any cell with a bad rep/sqlite is logged and skipped.
-  4. Extracts walk-side and ingest-side metrics using the helpers in
-     run_ablation.py (same outlier rejection rule).
-  5. Merges nsys columns into a fresh <base>_final.csv that subsumes
-     the throughput-only CSV from Phase 2.
+  4. Extracts walk-side and ingest-side metrics with the same outlier
+     rejection rule as run_ablation.py.
+  5. Merges nsys columns into <base>_final.csv (preserves Phase-2
+     throughput data; just adds nsys columns).
   6. Writes <base>_ingest.csv (one row per dataset, variant-agnostic
      since add_multiple_edges is the same path across variants).
 
 Usage:
-  python3 run_phase3.py coin.csv flight.csv delicious.csv \\
+  python3 run_profiling.py coin.csv flight.csv delicious.csv \\
       --base ablation_results_2 --block-dim 256 \\
       --nsys /its/home/ms2420/cuda-12.6/bin/nsys
 
   # Or, to retry extraction on existing .nsys-rep files without
   # re-profiling (fast; useful when the toolkit nsys is now correct
   # and the originals are good):
-  python3 run_phase3.py ... --reuse-existing
+  python3 run_profiling.py ... --reuse-existing
 """
 import argparse
 import csv
@@ -42,16 +40,125 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Reuse the building blocks from run_ablation.py so logic stays in
-# one place (outlier rejection threshold, extractors, etc.).
+# Reuse the building blocks from run_ablation.py so logic stays in one
+# place (outlier rejection threshold, throughput-line parser, etc.).
+# nsys-specific helpers live here — Phase 1+2 don't need them.
 from run_ablation import (
     ALL_VARIANTS, NG_VARIANTS, DATASETS, PRESETS,
-    USE_GPU, PICKER, IS_DIRECTED, TIMESCALE,
-    NSYS_RUNS_PER_CELL,
     build_run_argv, parse_throughput,
-    _extract_walk, _extract_ingest,
     mean_std, reject_outliers, fmt_drop, write_csv,
 )
+
+NSYS_RUNS_PER_CELL = 3
+
+# Candidate names for the NVTX-events table across nsys versions.
+_NVTX_TABLE_CANDIDATES = (
+    'NVTX_EVENTS',          # nsys <= 2024.x (and most current Linux installs)
+    'NVTX_PUSHPOP_EVENTS',  # newer nsys schema variant
+    'NSYS_EVENTS_NVTX_PUSHPOP',
+)
+
+
+def _find_nvtx_table(db):
+    """Return whichever NVTX-events table the SQLite export contains.
+    nsys versions differ in table naming. Raises if none is found."""
+    rows = db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    have = {r[0] for r in rows}
+    for c in _NVTX_TABLE_CANDIDATES:
+        if c in have:
+            return c
+    nvtx_like = sorted(t for t in have if 'NVTX' in t.upper())
+    raise RuntimeError(
+        'no NVTX events table in SQLite export — checked '
+        f'{list(_NVTX_TABLE_CANDIDATES)}. Tables matching NVTX: '
+        f'{nvtx_like or "(none)"}. Confirm nsys was invoked with '
+        '`--trace=cuda,nvtx` and that the binary links libnvToolsExt.')
+
+
+def _extract_walk(db):
+    """Walk-side metrics from `walk_sampling_batch` NVTX ranges."""
+    nvtx_tbl = _find_nvtx_table(db)
+    ranges = db.execute(
+        f"SELECT start, end FROM {nvtx_tbl} WHERE text = 'walk_sampling_batch' "
+        "ORDER BY start"
+    ).fetchall()
+    if not ranges:
+        return None
+    per_call = []
+    for s, e in ranges:
+        row = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(end - start), 0) "
+            "FROM CUPTI_ACTIVITY_KIND_KERNEL "
+            "WHERE start >= ? AND end <= ?", (s, e)
+        ).fetchone()
+        n_kern, t_kern_ns = row[0], row[1]
+        per_call.append((n_kern, t_kern_ns / 1e6, (e - s) / 1e6))
+    n_calls       = len(per_call)
+    total_kern_ms = sum(r[1] for r in per_call)
+    total_n_kern  = sum(r[0] for r in per_call)
+    total_nvtx_ms = sum(r[2] for r in per_call)
+    return {
+        'kern_time_per_call_ms':  total_kern_ms / n_calls,
+        'kern_launches_per_call': total_n_kern / n_calls,
+        'per_kernel_us':          (total_kern_ms / max(1, total_n_kern)) * 1000.0,
+        'gpu_active_frac':        total_kern_ms / total_nvtx_ms if total_nvtx_ms else 0.0,
+    }
+
+
+def _extract_ingest(db):
+    """Ingest-side metrics from `ingestion_batch` NVTX ranges. Returns
+    None if the binary did not emit ingestion NVTX (e.g., walk-only run).
+
+    Bucket criteria (substring match on resolved kernel name):
+      - sort+merge :   `RadixSort` or `merge_kernel`
+      - weight     :   `compute_per_node_weights`
+    H2D bytes/duration come from CUPTI_ACTIVITY_KIND_MEMCPY with
+    copyKind = 1 (Host-to-Device).
+    """
+    nvtx_tbl = _find_nvtx_table(db)
+    ranges = db.execute(
+        f"SELECT start, end FROM {nvtx_tbl} WHERE text = 'ingestion_batch' "
+        "ORDER BY start"
+    ).fetchall()
+    if not ranges:
+        return None
+    per_call = []
+    for s, e in ranges:
+        nvtx_ms = (e - s) / 1e6
+        kerns = db.execute("""
+            SELECT k.start, k.end,
+                   COALESCE(d.value, m.value, sn.value, '') AS name
+            FROM CUPTI_ACTIVITY_KIND_KERNEL k
+            LEFT JOIN StringIds d  ON d.id  = k.demangledName
+            LEFT JOIN StringIds m  ON m.id  = k.mangledName
+            LEFT JOIN StringIds sn ON sn.id = k.shortName
+            WHERE k.start >= ? AND k.end <= ?
+        """, (s, e)).fetchall()
+        n_launches = len(kerns)
+        sort_ms    = sum((k[1] - k[0]) for k in kerns
+                         if 'RadixSort' in k[2] or 'merge_kernel' in k[2]) / 1e6
+        weight_ms  = sum((k[1] - k[0]) for k in kerns
+                         if 'compute_per_node_weights' in k[2]) / 1e6
+        h2d_ms = (db.execute(
+            "SELECT COALESCE(SUM(end - start), 0) "
+            "FROM CUPTI_ACTIVITY_KIND_MEMCPY "
+            "WHERE start >= ? AND end <= ? AND copyKind = 1", (s, e)
+        ).fetchone()[0]) / 1e6
+        per_call.append({
+            'total_ms':  nvtx_ms,
+            'sort_ms':   sort_ms,
+            'weight_ms': weight_ms,
+            'h2d_ms':    h2d_ms,
+            'launches':  n_launches,
+        })
+    n = len(per_call)
+    return {
+        'ingest_total_ms':  sum(c['total_ms']  for c in per_call) / n,
+        'ingest_sort_ms':   sum(c['sort_ms']   for c in per_call) / n,
+        'ingest_weight_ms': sum(c['weight_ms'] for c in per_call) / n,
+        'ingest_h2d_ms':    sum(c['h2d_ms']    for c in per_call) / n,
+        'ingest_launches':  sum(c['launches']  for c in per_call) / n,
+    }
 
 # ===========================================================
 # Hardcoded winning config (from Phase 1 of run on 2026-04-26).
