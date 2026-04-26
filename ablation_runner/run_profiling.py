@@ -196,48 +196,89 @@ def export_and_validate(nsys_bin, rep_path):
     """Force a fresh `nsys export -t sqlite` and verify the result has
     the expected tables. Raises on bad rep / bad export.
 
-    Without --output, nsys 2024.4.2 (HPC toolkit at /its/home/ms2420/
-    cuda-12.6/bin/) silently writes the sqlite to the *current working
-    directory* with the rep's basename — not next to the .nsys-rep as
-    older versions did. Pass --output explicitly to pin the location;
-    add a basename-search fallback so we still recover even when a
-    weirder version writes it somewhere else."""
-    rep_path = Path(rep_path)
+    nsys versions vary in --output handling (some honor it, some ignore
+    it and write to cwd, some append .sqlite to the value, some don't).
+    Strategy: try a sequence of invocations until one of them produces
+    a file at a path we can find, then move it to the canonical
+    `<rep>.sqlite` location. On total failure, print a wide diagnostic
+    listing every fresh .sqlite found anywhere on common search paths.
+    """
+    import time
+    rep_path = Path(rep_path).resolve()
     if not rep_path.exists():
         raise RuntimeError(f'.nsys-rep not found: {rep_path}')
     sql_path = rep_path.with_suffix('.sqlite')
     if sql_path.exists():
         sql_path.unlink()
 
-    proc = subprocess.run(
-        [nsys_bin, 'export', '-t', 'sqlite',
-         '--force-overwrite=true',
-         '--output', str(sql_path),
-         str(rep_path)],
-        capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f'nsys export exit {proc.returncode}. stderr tail:\n'
-            f'{proc.stderr[-500:]}')
+    pre_time = time.time() - 2  # 2s buffer for clock skew / fs flush
 
-    # Defensive fallback: if nsys still parked the file elsewhere
-    # (.sqlite.sqlite from double-extension append, or cwd from a
-    # version that ignores --output), find and move it.
-    if not sql_path.exists():
-        for alt in (
+    # Try (a) no --output (older nsys default = next to rep), (b)
+    # --output with .sqlite suffix, (c) --output without extension
+    # (some versions append .sqlite). First one whose output we can
+    # find wins.
+    attempts = [
+        # (description, argv list)
+        ('no --output (default location)',
+         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
+          str(rep_path)]),
+        ('--output with .sqlite',
+         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
+          '--output', str(sql_path), str(rep_path)]),
+        ('--output without extension',
+         [nsys_bin, 'export', '-t', 'sqlite', '--force-overwrite=true',
+          '--output', str(sql_path.with_suffix('')), str(rep_path)]),
+    ]
+
+    last_proc = None
+    last_cmd  = None
+    for desc, cmd in attempts:
+        last_cmd = cmd
+        last_proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if last_proc.returncode != 0:
+            continue  # try next attempt
+        # Search likely landing spots for a fresh sqlite.
+        candidates = [
+            sql_path,
             sql_path.with_suffix('.sqlite.sqlite'),
             Path.cwd() / sql_path.name,
+            Path.cwd() / (sql_path.stem + '.sqlite'),
             Path.cwd() / sql_path.with_suffix('.sqlite.sqlite').name,
-        ):
-            if alt.exists():
-                alt.rename(sql_path)
-                break
+        ]
+        found = None
+        for c in candidates:
+            try:
+                if c.exists() and c.stat().st_mtime >= pre_time and c.stat().st_size > 0:
+                    found = c
+                    break
+            except (FileNotFoundError, PermissionError):
+                pass
+        if found is not None:
+            if found != sql_path:
+                found.rename(sql_path)
+            break
+    else:
+        # All attempts ran but none produced a findable file.
+        recent = []
+        for d in (Path.cwd(), rep_path.parent, Path('/tmp')):
+            try:
+                for p in d.glob('*.sqlite'):
+                    if p.stat().st_mtime >= pre_time:
+                        recent.append(f'{p} ({p.stat().st_size} bytes)')
+            except (FileNotFoundError, PermissionError):
+                pass
+        raise RuntimeError(
+            f'nsys export produced no findable .sqlite for {rep_path}.\n'
+            f'last cmd: {" ".join(last_cmd or [])}\n'
+            f'last exit: {last_proc.returncode if last_proc else "—"}\n'
+            f'fresh .sqlite anywhere: {recent or "(none)"}\n'
+            f'stdout tail:\n{(last_proc.stdout if last_proc else "")[-300:]}\n'
+            f'stderr tail:\n{(last_proc.stderr if last_proc else "")[-300:]}')
 
     if not sql_path.exists():
         raise RuntimeError(
-            f'nsys export returned 0 but {sql_path} was not produced. '
-            f'Searched fallbacks: <rep>.sqlite.sqlite, cwd. '
-            f'stderr tail:\n{proc.stderr[-500:]}')
+            f'export attempted but {sql_path} still missing after rename. '
+            f'last cmd: {" ".join(last_cmd or [])}')
     # Verify the export actually wrote the schema we depend on.
     db = sqlite3.connect(sql_path)
     try:
