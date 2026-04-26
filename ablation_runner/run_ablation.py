@@ -272,16 +272,29 @@ def _extract_ingest(db):
 
 def extract_nsys_metrics(nsys_bin, rep_path):
     """Returns (walk_dict, ingest_dict). Either may be None if the
-    corresponding NVTX range is absent. Raises only if the SQLite export
-    itself fails or yields no kernel timeline."""
+    corresponding NVTX range is absent OR if the corresponding extractor
+    raised (the failure is logged to stderr; the OTHER extractor still
+    runs). Raises only if the SQLite export itself fails or both
+    extractors failed."""
     sql_path = export_to_sqlite(nsys_bin, rep_path)
     db = sqlite3.connect(sql_path)
     try:
-        walk = _extract_walk(db)
-        ingest = _extract_ingest(db)
+        try:
+            walk = _extract_walk(db)
+        except Exception as e:
+            print(f'    [walk extraction failed for {rep_path}: '
+                  f'{type(e).__name__}: {e}]', file=sys.stderr)
+            walk = None
+        try:
+            ingest = _extract_ingest(db)
+        except Exception as e:
+            print(f'    [ingest extraction failed for {rep_path}: '
+                  f'{type(e).__name__}: {e}]', file=sys.stderr)
+            ingest = None
         if walk is None and ingest is None:
             raise RuntimeError(
-                f'no walk_sampling_batch or ingestion_batch NVTX in {rep_path}')
+                f'no walk_sampling_batch or ingestion_batch NVTX (or both '
+                f'extractors failed) in {rep_path}')
         return walk, ingest
     finally:
         db.close()
@@ -705,21 +718,20 @@ def main() -> int:
         })
 
     # ===========================================================
-    # Final CSV writes (overwrite the Phase 2 throughput-only checkpoint
-    # with the merged Phase 2 + Phase 3 row, and write the ingest CSV).
+    # Final CSV writes. Tuning CSV was already written at the Phase-1
+    # checkpoint and tuning_rows hasn't changed since — no rewrite.
+    # Final CSV gets overwritten here with nsys columns merged in
+    # (the Phase-2 checkpoint had throughput-only columns). Ingest CSV
+    # is fresh.
     # ===========================================================
-    if not tuning_rows:
-        print('No successful tuning runs.', file=sys.stderr); return 1
     if not final_rows:
         print('No successful final runs.', file=sys.stderr); return 1
 
-    write_csv(out_tune, tuning_rows)
     write_csv(out_final, final_rows)
     if ingest_rows:
         write_csv(out_ingest, ingest_rows)
 
     print()
-    print(f'Wrote {len(tuning_rows)} tuning rows to {out_tune}')
     print(f'Wrote {len(final_rows)} final rows to {out_final}')
     if ingest_rows:
         print(f'Wrote {len(ingest_rows)} ingest rows to {out_ingest}')
