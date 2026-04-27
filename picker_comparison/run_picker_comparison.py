@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TEA+/Tempest picker × CPU/GPU comparison runner.
+TEA+/Tempest picker × CPU/GPU comparison runner (bulk-only).
 
 For each (dataset × edge_picker × mode) cell, drives
 walk_sampling_speed_test N times and aggregates ingest- and walk-sampling
@@ -17,19 +17,19 @@ Pickers swept (edge picker; start picker fixed to Uniform):
 
 Datasets: growth, delicious. Both passed as positional args.
 
-Modes: CPU (FULL_WALK kernel) and GPU (NODE_GROUPED kernel; CUDA build
-required for the GPU rows).
+Modes: CPU (FULL_WALK kernel) and GPU. GPU's kernel-launch-type is
+picker-conditional:
+  - TemporalNode2Vec on GPU → FULL_WALK. The cooperative scheduler
+    can't share panels across walks for Node2Vec because each walk's
+    CDF depends on its own prev_node. The NG dispatcher already
+    bypasses to per_walk_step_kernel for this picker, so FULL_WALK
+    is the cleaner explicit choice and avoids the scheduler
+    setup/teardown overhead that NG would still pay around the
+    per-walk kernel.
+  - All other pickers on GPU → NODE_GROUPED.
 
 Walks: 1 walk per node, max walk length 80, undirected — matching the
 TEA+ paper's experimental config (Table tab:comparison_with_tea).
-
-Streaming: bulk-on-GPU OOMs on delicious (33.8 M nodes x mwl=80 walk
-output exceeds A40 VRAM). For that one (dataset, mode) cell we set
-batch_divider=20, window_divider=5 — sort edges by ts, split into 20
-equal-time batches, run ingest+walk per batch with max_time_capacity
-= total_span / 5 evicting older edges. Reported ingest/walk seconds
-are the SUM across batches. Other cells use bulk (1, 1). Per-cell
-dividers live in DIVIDERS below. (Earlier values 10/3 still OOMed.)
 
 Outlier rejection mirrors run_ablation.py: median-relative threshold
 0.15, MIN_KEEP=3.
@@ -62,26 +62,17 @@ START_PICKER = 'Uniform'
 DATASETS     = ['growth', 'delicious']
 MODES        = ['GPU', 'CPU']
 
-# CPU has no scheduler — only FULL_WALK is implemented. GPU uses NG by default.
-MODE_KLT = {
-    'CPU': 'FULL_WALK',
-    'GPU': 'NODE_GROUPED',
-}
+# CPU has only FULL_WALK. On GPU, TemporalNode2Vec gets FULL_WALK too —
+# its per-walk CDF defeats coop sharing, so NG just adds scheduler
+# overhead around the per_walk_step_kernel it would have routed to
+# anyway. All other GPU pickers use NODE_GROUPED.
+def kernel_launch_type(mode: str, picker: str) -> str:
+    if mode == 'CPU':
+        return 'FULL_WALK'
+    if picker == 'TemporalNode2Vec':
+        return 'FULL_WALK'
+    return 'NODE_GROUPED'
 
-# (batch_divider, window_divider) per (dataset, mode).
-#   1, 1                 -> bulk mode (single batch, no eviction).
-#   batch_divider > 1    -> split into N equal-time batches.
-#   window_divider > 1   -> set max_time_capacity = total_span / window_divider
-#                           so older edges are evicted as new ones arrive.
-# delicious bulk-on-GPU OOMs the walk-output buffer on a 48 GB A40 (33.8 M
-# nodes x mwl=80 x ~24 B/slot ~= 65 GB), so we stream it. CPU has system
-# RAM and can take the bulk run; growth is small enough to fit either way.
-DIVIDERS = {
-    ('growth',    'CPU'): (1, 1),
-    ('growth',    'GPU'): (1, 1),
-    ('delicious', 'CPU'): (1, 1),
-    ('delicious', 'GPU'): (50, 10),
-}
 
 # Match the TEA+ paper's experimental config.
 NUM_WALKS_PER_NODE = 1
@@ -132,8 +123,7 @@ def mean_std(xs):
     return mu, sd
 
 
-def invoke(binary, csv_path, use_gpu, picker, klt,
-           batch_divider, window_divider, timeout_sec):
+def invoke(binary, csv_path, use_gpu, picker, klt, timeout_sec):
     """Run walk_sampling_speed_test once; return parsed metrics dict."""
     cmd = [
         binary, csv_path,
@@ -145,8 +135,6 @@ def invoke(binary, csv_path, use_gpu, picker, klt,
         picker,
         START_PICKER,
         klt,
-        str(batch_divider),
-        str(window_divider),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, text=True,
@@ -218,24 +206,17 @@ def main() -> int:
     for ds in DATASETS:
         for picker in PICKERS:
             for mode in MODES:
-                klt                          = MODE_KLT[mode]
-                use_gpu                      = (mode == 'GPU')
-                batch_divider, window_divider = DIVIDERS[(ds, mode)]
-                stream_tag = (
-                    f' [stream b={batch_divider} w={window_divider}]'
-                    if (batch_divider > 1 or window_divider > 1)
-                    else ''
-                )
+                klt     = kernel_launch_type(mode, picker)
+                use_gpu = (mode == 'GPU')
 
                 cell_runs = []
-                tag = f'  {ds:>9} / {picker:<18} / {mode:<3}{stream_tag}'
+                tag = f'  {ds:>9} / {picker:<18} / {mode:<3} / {klt:<26}'
                 for i in range(args.runs):
-                    print(f'{tag} run {i+1}/{args.runs} ...', end=' ', flush=True)
+                    print(f'{tag} run {i+1}/{args.runs} ...',
+                          end=' ', flush=True)
                     try:
                         r = invoke(args.binary, paths[ds],
-                                   use_gpu, picker, klt,
-                                   batch_divider, window_divider,
-                                   args.timeout)
+                                   use_gpu, picker, klt, args.timeout)
                     except (RuntimeError, subprocess.TimeoutExpired) as e:
                         print(f'FAIL ({type(e).__name__}: {e})',
                               file=sys.stderr)
@@ -280,8 +261,6 @@ def main() -> int:
                     'num_walks_per_node':   NUM_WALKS_PER_NODE,
                     'max_walk_length':      MAX_WALK_LEN,
                     'is_directed':          IS_DIRECTED,
-                    'batch_divider':        batch_divider,
-                    'window_divider':       window_divider,
                     'n_runs_raw':           len(cell_runs),
                     'n_runs_kept':          len(walk_kept),
                     'ingest_seconds_mean':  im,
