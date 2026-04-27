@@ -23,6 +23,14 @@ required for the GPU rows).
 Walks: 1 walk per node, max walk length 80, undirected — matching the
 TEA+ paper's experimental config (Table tab:comparison_with_tea).
 
+Streaming: bulk-on-GPU OOMs on delicious (33.8 M nodes x mwl=80 walk
+output exceeds A40 VRAM). For that one (dataset, mode) cell we set
+batch_divider=10, window_divider=3 — sort edges by ts, split into 10
+equal-time batches, run ingest+walk per batch with max_time_capacity
+= total_span / 3 evicting older edges. Reported ingest/walk seconds
+are the SUM across batches. Other cells use bulk (1, 1). Per-cell
+dividers live in DIVIDERS below.
+
 Outlier rejection mirrors run_ablation.py: median-relative threshold
 0.15, MIN_KEEP=3.
 
@@ -58,6 +66,21 @@ MODES        = ['GPU', 'CPU']
 MODE_KLT = {
     'CPU': 'FULL_WALK',
     'GPU': 'NODE_GROUPED',
+}
+
+# (batch_divider, window_divider) per (dataset, mode).
+#   1, 1                 -> bulk mode (single batch, no eviction).
+#   batch_divider > 1    -> split into N equal-time batches.
+#   window_divider > 1   -> set max_time_capacity = total_span / window_divider
+#                           so older edges are evicted as new ones arrive.
+# delicious bulk-on-GPU OOMs the walk-output buffer on a 48 GB A40 (33.8 M
+# nodes x mwl=80 x ~24 B/slot ~= 65 GB), so we stream it. CPU has system
+# RAM and can take the bulk run; growth is small enough to fit either way.
+DIVIDERS = {
+    ('growth',    'CPU'): (1, 1),
+    ('growth',    'GPU'): (1, 1),
+    ('delicious', 'CPU'): (1, 1),
+    ('delicious', 'GPU'): (10, 3),
 }
 
 # Match the TEA+ paper's experimental config.
@@ -109,7 +132,8 @@ def mean_std(xs):
     return mu, sd
 
 
-def invoke(binary, csv_path, use_gpu, picker, klt, timeout_sec):
+def invoke(binary, csv_path, use_gpu, picker, klt,
+           batch_divider, window_divider, timeout_sec):
     """Run walk_sampling_speed_test once; return parsed metrics dict."""
     cmd = [
         binary, csv_path,
@@ -121,6 +145,8 @@ def invoke(binary, csv_path, use_gpu, picker, klt, timeout_sec):
         picker,
         START_PICKER,
         klt,
+        str(batch_divider),
+        str(window_divider),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, text=True,
@@ -192,16 +218,24 @@ def main() -> int:
     for ds in DATASETS:
         for picker in PICKERS:
             for mode in MODES:
-                klt     = MODE_KLT[mode]
-                use_gpu = (mode == 'GPU')
+                klt                          = MODE_KLT[mode]
+                use_gpu                      = (mode == 'GPU')
+                batch_divider, window_divider = DIVIDERS[(ds, mode)]
+                stream_tag = (
+                    f' [stream b={batch_divider} w={window_divider}]'
+                    if (batch_divider > 1 or window_divider > 1)
+                    else ''
+                )
 
                 cell_runs = []
-                tag = f'  {ds:>9} / {picker:<18} / {mode:<3}'
+                tag = f'  {ds:>9} / {picker:<18} / {mode:<3}{stream_tag}'
                 for i in range(args.runs):
                     print(f'{tag} run {i+1}/{args.runs} ...', end=' ', flush=True)
                     try:
                         r = invoke(args.binary, paths[ds],
-                                   use_gpu, picker, klt, args.timeout)
+                                   use_gpu, picker, klt,
+                                   batch_divider, window_divider,
+                                   args.timeout)
                     except (RuntimeError, subprocess.TimeoutExpired) as e:
                         print(f'FAIL ({type(e).__name__}: {e})',
                               file=sys.stderr)
@@ -246,6 +280,8 @@ def main() -> int:
                     'num_walks_per_node':   NUM_WALKS_PER_NODE,
                     'max_walk_length':      MAX_WALK_LEN,
                     'is_directed':          IS_DIRECTED,
+                    'batch_divider':        batch_divider,
+                    'window_divider':       window_divider,
                     'n_runs_raw':           len(cell_runs),
                     'n_runs_kept':          len(walk_kept),
                     'ingest_seconds_mean':  im,
