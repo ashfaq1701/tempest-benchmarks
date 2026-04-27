@@ -17,16 +17,16 @@ Pickers swept (edge picker; start picker fixed to Uniform):
 
 Datasets: growth, delicious. Both passed as positional args.
 
-Modes: CPU (FULL_WALK kernel) and GPU. GPU's kernel-launch-type is
-picker-conditional:
-  - TemporalNode2Vec on GPU → FULL_WALK. The cooperative scheduler
-    can't share panels across walks for Node2Vec because each walk's
-    CDF depends on its own prev_node. The NG dispatcher already
-    bypasses to per_walk_step_kernel for this picker, so FULL_WALK
-    is the cleaner explicit choice and avoids the scheduler
-    setup/teardown overhead that NG would still pay around the
-    per-walk kernel.
-  - All other pickers on GPU → NODE_GROUPED.
+Modes: CPU and GPU. The kernel-launch-type is intrinsic to the
+picker, not the mode:
+  - ExponentialIndex / ExponentialWeight / Linear → NODE_GROUPED (always).
+  - TemporalNode2Vec                              → FULL_WALK    (always).
+The CPU codepath ignores kernel_launch_type (the std walker handles
+all pickers), so the same KLT value is passed in both modes and the
+CSV records the picker's intrinsic kernel choice. On GPU, NG's
+dispatcher already bypasses to per_walk_step_kernel for Node2Vec, so
+declaring FULL_WALK explicitly avoids the scheduler setup/teardown
+overhead that NG would still pay around the per-walk kernel.
 
 Walks: 1 walk per node, max walk length 80, undirected — matching the
 TEA+ paper's experimental config (Table tab:comparison_with_tea).
@@ -62,13 +62,12 @@ START_PICKER = 'Uniform'
 DATASETS     = ['growth', 'delicious']
 MODES        = ['GPU', 'CPU']
 
-# CPU has only FULL_WALK. On GPU, TemporalNode2Vec gets FULL_WALK too —
-# its per-walk CDF defeats coop sharing, so NG just adds scheduler
-# overhead around the per_walk_step_kernel it would have routed to
-# anyway. All other GPU pickers use NODE_GROUPED.
-def kernel_launch_type(mode: str, picker: str) -> str:
-    if mode == 'CPU':
-        return 'FULL_WALK'
+# Picker -> kernel_launch_type. Mode-independent: the CPU codepath
+# ignores klt (the std walker dispatches all pickers internally), so the
+# CSV column reflects the picker's intrinsic kernel choice in both rows.
+# Node2Vec routes to FULL_WALK because its prev_node-dependent CDF
+# defeats the coop scheduler's panel sharing.
+def kernel_launch_type(picker: str) -> str:
     if picker == 'TemporalNode2Vec':
         return 'FULL_WALK'
     return 'NODE_GROUPED'
@@ -206,7 +205,7 @@ def main() -> int:
     for ds in DATASETS:
         for picker in PICKERS:
             for mode in MODES:
-                klt     = kernel_launch_type(mode, picker)
+                klt     = kernel_launch_type(picker)
                 use_gpu = (mode == 'GPU')
 
                 cell_runs = []
