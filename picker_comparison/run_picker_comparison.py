@@ -52,7 +52,7 @@ PICKERS = [
 ]
 START_PICKER = 'Uniform'
 DATASETS     = ['growth', 'delicious']
-MODES        = ['CPU', 'GPU']
+MODES        = ['GPU', 'CPU']
 
 # CPU has no scheduler — only FULL_WALK is implemented. GPU uses NG by default.
 MODE_KLT = {
