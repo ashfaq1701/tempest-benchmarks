@@ -55,7 +55,7 @@ BUCKETS = [
 DEFAULT_BIN       = './build/bin/ablation_streaming'
 DEFAULT_NSYS      = 'nsys'
 DEFAULT_VARIANT   = 'node_grouped'
-DEFAULT_W         = 8
+DEFAULT_W         = 4
 DEFAULT_BLOCK_DIM = 256
 
 

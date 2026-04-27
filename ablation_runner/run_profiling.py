@@ -164,7 +164,7 @@ def _extract_ingest(db):
 # Hardcoded winning config (from Phase 1 of run on 2026-04-26).
 # NG variants use this W; FW ignores w_threshold_warp so it's W=1.
 # ===========================================================
-WINNING_W_NG = 8
+WINNING_W_NG = 4
 WINNING_W_FW = 1
 
 DEFAULT_BIN          = './build/bin/ablation_streaming'
