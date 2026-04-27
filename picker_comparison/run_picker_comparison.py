@@ -80,7 +80,7 @@ DIVIDERS = {
     ('growth',    'CPU'): (1, 1),
     ('growth',    'GPU'): (1, 1),
     ('delicious', 'CPU'): (1, 1),
-    ('delicious', 'GPU'): (20, 5),
+    ('delicious', 'GPU'): (50, 10),
 }
 
 # Match the TEA+ paper's experimental config.
