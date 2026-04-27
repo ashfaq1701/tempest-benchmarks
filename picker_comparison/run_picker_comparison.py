@@ -25,11 +25,11 @@ TEA+ paper's experimental config (Table tab:comparison_with_tea).
 
 Streaming: bulk-on-GPU OOMs on delicious (33.8 M nodes x mwl=80 walk
 output exceeds A40 VRAM). For that one (dataset, mode) cell we set
-batch_divider=10, window_divider=3 — sort edges by ts, split into 10
+batch_divider=20, window_divider=5 — sort edges by ts, split into 20
 equal-time batches, run ingest+walk per batch with max_time_capacity
-= total_span / 3 evicting older edges. Reported ingest/walk seconds
+= total_span / 5 evicting older edges. Reported ingest/walk seconds
 are the SUM across batches. Other cells use bulk (1, 1). Per-cell
-dividers live in DIVIDERS below.
+dividers live in DIVIDERS below. (Earlier values 10/3 still OOMed.)
 
 Outlier rejection mirrors run_ablation.py: median-relative threshold
 0.15, MIN_KEEP=3.
@@ -80,7 +80,7 @@ DIVIDERS = {
     ('growth',    'CPU'): (1, 1),
     ('growth',    'GPU'): (1, 1),
     ('delicious', 'CPU'): (1, 1),
-    ('delicious', 'GPU'): (10, 3),
+    ('delicious', 'GPU'): (20, 5),
 }
 
 # Match the TEA+ paper's experimental config.
