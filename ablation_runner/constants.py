@@ -23,7 +23,7 @@ DATASETS      = ('delicious', 'coin', 'flight')
 
 # Per-dataset (wpn, num_batches, num_windows, max_walk_len). A40-sized.
 PRESETS = {
-    'delicious': ( 8, 30, 12, 10),
+    'delicious': ( 8, 30, 13, 10),
     'coin':      (20,  4,  1, 80),
     'flight':    (20,  4,  1, 80),
 }
