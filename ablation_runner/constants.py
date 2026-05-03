@@ -21,7 +21,7 @@ NG_VARIANTS   = ['node_grouped', 'node_grouped_global_only']
 DATASETS      = ('delicious', 'coin', 'flight')
 
 PRESETS = {
-    'delicious': ( 8, 40, 10, 10),
+    'delicious': ( 8, 30, 13, 10),
     'coin':      (20,  4,  1, 80),
     'flight':    (20,  4,  1, 80),
 }
