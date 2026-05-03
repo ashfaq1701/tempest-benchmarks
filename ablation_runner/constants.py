@@ -63,4 +63,4 @@ MIN_KEEP          = 3
 # band swallowed almost every W on the laptop traces.
 NOISE_BAND        = 0.005
 
-FINAL_RUNS_THR    = 3  # final throughput runs per (dataset, variant)
+FINAL_RUNS_THR    = 5  # final throughput runs per (dataset, variant)
