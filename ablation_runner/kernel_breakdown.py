@@ -33,7 +33,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from run_ablation import DATASETS, PRESETS, build_run_argv, parse_throughput
+from constants import (
+    DATASETS, PRESETS,
+    DEFAULT_BIN, DEFAULT_BLOCK_DIM, DEFAULT_NSYS,
+    W_WARP_VALUE,
+)
+from common import build_run_argv, parse_throughput
 
 
 # Bucket name -> demangled-name substring. Order matters for substring
@@ -52,11 +57,7 @@ BUCKETS = [
     ('partition_g',  'partition_by_g_kernel'),
 ]
 
-DEFAULT_BIN       = './build/bin/ablation_streaming'
-DEFAULT_NSYS      = 'nsys'
-DEFAULT_VARIANT   = 'node_grouped'
-DEFAULT_W         = 4
-DEFAULT_BLOCK_DIM = 256
+DEFAULT_VARIANT = 'node_grouped'
 
 
 def profile_and_count(nsys_bin, binary, dataset_csv, variant, preset, w,
@@ -133,8 +134,9 @@ def main() -> int:
     ap.add_argument('--variant', default=DEFAULT_VARIANT,
                     choices=['node_grouped', 'node_grouped_global_only',
                              'full_walk'])
-    ap.add_argument('--w', type=int, default=DEFAULT_W,
-                    help=f'w_threshold_warp (default: {DEFAULT_W})')
+    ap.add_argument('--w', type=int, default=W_WARP_VALUE,
+                    help=f'w_threshold_warp (default: {W_WARP_VALUE} '
+                         f'from constants.W_WARP_VALUE)')
     ap.add_argument('--block-dim', type=int, default=DEFAULT_BLOCK_DIM)
     ap.add_argument('--binary',     default=DEFAULT_BIN)
     ap.add_argument('--nsys',       default=DEFAULT_NSYS)

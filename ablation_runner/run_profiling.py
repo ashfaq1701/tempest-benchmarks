@@ -40,11 +40,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Reuse the building blocks from run_ablation.py so logic stays in one
-# place (outlier rejection threshold, throughput-line parser, etc.).
-# nsys-specific helpers live here — Phase 1+2 don't need them.
-from run_ablation import (
+# Reuse shared state from constants.py / common.py — single source of
+# truth for the winning W and the helpers that build / parse
+# ablation_streaming invocations. nsys-specific helpers live in this
+# file; Phase 1 (tuning_w.py) and Phase 2 (run_ablation.py) don't need
+# them.
+from constants import (
     ALL_VARIANTS, NG_VARIANTS, DATASETS, PRESETS,
+    DEFAULT_BIN, DEFAULT_BLOCK_DIM, DEFAULT_NSYS,
+    W_WARP_VALUE,
+)
+from common import (
     build_run_argv, parse_throughput,
     mean_std, reject_outliers, fmt_drop, write_csv,
 )
@@ -160,21 +166,16 @@ def _extract_ingest(db):
         'ingest_launches':  sum(c['launches']  for c in per_call) / n,
     }
 
-# ===========================================================
-# Hardcoded winning config (from Phase 1 of run on 2026-04-26).
-# NG variants use this W; FW ignores w_threshold_warp so it's W=1.
-# ===========================================================
-WINNING_W_NG = 4
-WINNING_W_FW = 1
+# NG variants use W_WARP_VALUE from constants.py. FW ignores
+# w_threshold_warp entirely (only NG uses it), so its W is hardcoded
+# below — value is irrelevant for FW correctness or perf.
+W_FW_HARDCODED = 1
 
-DEFAULT_BIN          = './build/bin/ablation_streaming'
-DEFAULT_BASE         = 'ablation_results_2'
-DEFAULT_BLOCK_DIM    = 256
-DEFAULT_NSYS         = 'nsys'
+DEFAULT_BASE   = 'ablation_results_2'
 
 
 def cell_w(variant: str) -> int:
-    return WINNING_W_NG if variant in NG_VARIANTS else WINNING_W_FW
+    return W_WARP_VALUE if variant in NG_VARIANTS else W_FW_HARDCODED
 
 
 def invoke_nsys(nsys_bin, rep_path, binary, data, klt, wpn, nb, nw, mwl,
@@ -331,7 +332,8 @@ def main() -> int:
     print(f'# binary           : {args.binary}')
     print(f'# nsys             : {args.nsys}')
     print(f'# block_dim        : {args.block_dim}')
-    print(f'# winning W (NG)   : {WINNING_W_NG}  (FW uses {WINNING_W_FW})')
+    print(f'# W (NG variants)  : {W_WARP_VALUE}  (constants.W_WARP_VALUE)')
+    print(f'# W (FW)           : {W_FW_HARDCODED}  (hardcoded; FW ignores W)')
     print(f'# nsys runs/cell   : {NSYS_RUNS_PER_CELL}')
     print(f'# reuse-existing   : {args.reuse_existing}')
     print(f'# nsys reports dir : {nsys_dir}')
