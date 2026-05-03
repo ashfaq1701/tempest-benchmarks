@@ -14,16 +14,16 @@ W_WARP_VALUE = 4
 
 
 # Variants under test.
-ALL_VARIANTS  = ['full_walk', 'node_grouped', 'node_grouped_global_only']
+ALL_VARIANTS  = ['node_grouped', 'full_walk', 'node_grouped_global_only']
 NG_VARIANTS   = ['node_grouped', 'node_grouped_global_only']
 
 # Datasets used by every script in this directory.
 DATASETS      = ('delicious', 'coin', 'flight')
 
 PRESETS = {
-    'delicious': ( 8, 50, 10, 10),
-    'coin':      (20,  5,  2, 80),
-    'flight':    (20,  5,  2, 80),
+    'delicious': ( 8, 30, 10, 10),
+    'coin':      (20,  4,  1, 80),
+    'flight':    (20,  4,  1, 80),
 }
 
 # ============================================================
