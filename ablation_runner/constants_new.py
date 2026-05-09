@@ -37,5 +37,5 @@ DATASETS = ('wiki-talk', 'tgbl-comment', 'sx-stackoverflow')
 PRESETS = {
     'wiki-talk':        (20, 4, 1, 80),
     'tgbl-comment':     (20, 4, 1, 80),
-    'sx-stackoverflow': (20, 4, 2, 80),
+    'sx-stackoverflow': (20, 4, 2, 40),
 }
