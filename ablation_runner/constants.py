@@ -18,7 +18,7 @@ ALL_VARIANTS  = ['node_grouped', 'full_walk', 'node_grouped_global_only']
 NG_VARIANTS   = ['node_grouped', 'node_grouped_global_only']
 
 # Datasets used by every script in this directory.
-DATASETS      = ('delicious', 'coin', 'flight')
+DATASETS      = ('delicious', 'coin', 'flight', 'tgbl-comment')
 
 
 # Per-dataset (wpn, num_batches, num_windows, max_walk_len). A40-sized.
@@ -26,6 +26,7 @@ PRESETS = {
     'delicious': ( 8, 30, 13, 10),
     'coin':      (20,  4,  1, 80),
     'flight':    (20,  4,  1, 80),
+    'tgbl-comment':     (20, 4, 1, 80),
 }
 
 # ============================================================
