@@ -23,7 +23,7 @@ This script does the nsys-derived profiling step on top of those CSVs:
      since add_multiple_edges is the same path across variants).
 
 Usage:
-  python3 run_profiling.py coin.csv flight.csv delicious.csv \\
+  python3 run_profiling.py coin.csv flight.csv delicious.csv tgbl-comment.csv \\
       --base ablation_results_2 --block-dim 256 \\
       --nsys /its/home/ms2420/cuda-12.6/bin/nsys
 
@@ -295,9 +295,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('coin_csv',      help='Path to ml_tgbl-coin.csv')
-    ap.add_argument('flight_csv',    help='Path to ml_tgbl-flight.csv')
-    ap.add_argument('delicious_csv', help='Path to delicious(_clip).csv')
+    ap.add_argument('coin_csv',         help='Path to ml_tgbl-coin.csv')
+    ap.add_argument('flight_csv',       help='Path to ml_tgbl-flight.csv')
+    ap.add_argument('delicious_csv',    help='Path to delicious(_clip).csv')
+    ap.add_argument('tgbl_comment_csv', help='Path to ml_tgbl-comment.csv')
     ap.add_argument('--base',       default=DEFAULT_BASE,
                     help=f'Output base prefix (default: {DEFAULT_BASE}).')
     ap.add_argument('--binary',     default=DEFAULT_BIN,
@@ -317,7 +318,8 @@ def main() -> int:
     if not Path(args.binary).is_file() and not args.reuse_existing:
         ap.error(f'binary not found: {args.binary}')
     paths = {'coin': args.coin_csv, 'flight': args.flight_csv,
-             'delicious': args.delicious_csv}
+             'delicious': args.delicious_csv,
+             'tgbl-comment': args.tgbl_comment_csv}
     for name, p in paths.items():
         if not Path(p).is_file():
             ap.error(f'{name} CSV not found: {p}')

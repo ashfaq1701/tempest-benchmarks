@@ -23,7 +23,7 @@ Buckets reported:
 "other" gathers thrust/CUB internal kernels (sort, RLE, scan, etc.).
 
 Usage:
-  python3 kernel_breakdown.py coin.csv flight.csv delicious.csv \\
+  python3 kernel_breakdown.py coin.csv flight.csv delicious.csv tgbl-comment.csv \\
       --variant node_grouped --w 8 \\
       --nsys /its/home/ms2420/cuda-12.6/bin/nsys
 """
@@ -128,9 +128,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('coin_csv',      help='Path to ml_tgbl-coin.csv')
-    ap.add_argument('flight_csv',    help='Path to ml_tgbl-flight.csv')
-    ap.add_argument('delicious_csv', help='Path to delicious(_clip).csv')
+    ap.add_argument('coin_csv',         help='Path to ml_tgbl-coin.csv')
+    ap.add_argument('flight_csv',       help='Path to ml_tgbl-flight.csv')
+    ap.add_argument('delicious_csv',    help='Path to delicious(_clip).csv')
+    ap.add_argument('tgbl_comment_csv', help='Path to ml_tgbl-comment.csv')
     ap.add_argument('--variant', default=DEFAULT_VARIANT,
                     choices=['node_grouped', 'node_grouped_global_only',
                              'full_walk'])
@@ -145,7 +146,8 @@ def main() -> int:
     args = ap.parse_args()
 
     paths = {'coin': args.coin_csv, 'flight': args.flight_csv,
-             'delicious': args.delicious_csv}
+             'delicious': args.delicious_csv,
+             'tgbl-comment': args.tgbl_comment_csv}
     for name, p in paths.items():
         if not Path(p).is_file():
             ap.error(f'{name} CSV not found: {p}')

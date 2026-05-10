@@ -16,7 +16,7 @@ different winner from the current constant, update constants.py manually.
 
 Usage:
   cd ablation_runner
-  python3 tuning_w.py coin.csv flight.csv delicious.csv \\
+  python3 tuning_w.py coin.csv flight.csv delicious.csv tgbl-comment.csv \\
       --output ablation_results --block-dim 256
 
 Default --binary is ../../temporal-random-walk/build/bin/ablation_streaming.
@@ -44,9 +44,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('coin_csv',      help='Path to ml_tgbl-coin.csv')
-    ap.add_argument('flight_csv',    help='Path to ml_tgbl-flight.csv')
-    ap.add_argument('delicious_csv', help='Path to delicious(_clip).csv')
+    ap.add_argument('coin_csv',         help='Path to ml_tgbl-coin.csv')
+    ap.add_argument('flight_csv',       help='Path to ml_tgbl-flight.csv')
+    ap.add_argument('delicious_csv',    help='Path to delicious(_clip).csv')
+    ap.add_argument('tgbl_comment_csv', help='Path to ml_tgbl-comment.csv')
     ap.add_argument('--binary',     default=DEFAULT_BIN,
                     help=f'Path to ablation_streaming (default: {DEFAULT_BIN}).')
     ap.add_argument('--output',     default=DEFAULT_OUTPUT_BASE,
@@ -60,7 +61,8 @@ def main() -> int:
     if not Path(args.binary).is_file():
         ap.error(f'binary not found: {args.binary}')
     paths = {'coin': args.coin_csv, 'flight': args.flight_csv,
-             'delicious': args.delicious_csv}
+             'delicious': args.delicious_csv,
+             'tgbl-comment': args.tgbl_comment_csv}
     for name, p in paths.items():
         if not Path(p).is_file():
             ap.error(f'{name} CSV not found: {p}')
