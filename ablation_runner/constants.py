@@ -59,7 +59,7 @@ TIMESCALE   = '-1'
 # Iterative median-relative threshold: drop the value whose deviation
 # from the running median exceeds OUTLIER_THRESHOLD * median, until the
 # worst remaining is within threshold OR len(kept) == MIN_KEEP.
-OUTLIER_THRESHOLD = 0.15
+OUTLIER_THRESHOLD = 0.10
 MIN_KEEP          = 3
 
 # Aggregate-W tie-break band for tuning. Tightened to 0.5% — at 1% the
