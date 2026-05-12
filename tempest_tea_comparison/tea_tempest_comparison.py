@@ -14,12 +14,25 @@ implicit).  TEA-reimpl runs via tea_walk with tea_hpat by default,
 falling back to tea_pat for delicious whose HPAT footprint overflows
 a 24 GB laptop (paper §3.2 describes PAT as the memory-bound fallback).
 
-Tunables on the CLI (everything else is a module constant — edit
-this file if you need to change the dataset list or pickers):
+Tunables on the CLI:
     --env path                .env file with dataset paths
     --runs N                  runs per (dataset, bias, engine) cell
     --timescale-bound X       exp-bias rescale, passed to both engines
     --omp-threads N           OMP_NUM_THREADS for tea_walk
+
+Hardcoded module constants (edit this file to change them):
+    PRESETS                   per-dataset (walks_per_node, max_walk_len)
+    ENV_KEY                   per-dataset env-var name in .env
+    TEA_VARIANT               per-dataset tea_walk variant (hpat / pat)
+    BIAS_PICKERS              (display, Tempest enum, TEA enum) per bias
+    IS_DIRECTED               1 — these datasets are directed temporal
+                              interactions (user→item, sender→receiver).
+                              The TEA paper §2.1 doesn't actually specify
+                              direction (just defines G = (V, E, R)), so
+                              this is our judgement call, not a paper-
+                              required value.
+    TEMPEST_START_PICKER      walk_sampling_speed_test's default
+    TEMPEST_KLT               NODE_GROUPED — Tempest's headline path
 """
 import argparse
 import os
@@ -85,7 +98,17 @@ BIAS_PICKERS = [
 ]
 
 # Fixed across all runs.
-IS_DIRECTED          = 0                       # undirected (matches paper / ablation_runner)
+#
+# IS_DIRECTED: the TEA paper §2.1 just defines G = (V, E, R) without
+# specifying directionality.  Tempest's ablation_runner uses IS_DIRECTED=0
+# by convention, but the datasets we run are all directed temporal
+# interactions (growth/delicious: user→item actions; tgbl-*: directed
+# temporal events).  Both engines get the same value either way, so the
+# comparison is internally fair; we pick 1 here to match the actual
+# data semantics and to stay consistent with tea_report_runtime.py
+# (which also uses 1 so the laptop figures across both scripts come
+# from the same edge interpretation).
+IS_DIRECTED          = 1
 TEMPEST_START_PICKER = 'ExponentialWeight'     # walk_sampling_speed_test default
 TEMPEST_KLT          = 'NODE_GROUPED'
 
@@ -176,6 +199,15 @@ def mean_std(xs):
     return statistics.mean(xs), (statistics.stdev(xs) if len(xs) > 1 else 0.0)
 
 
+def fmt_cell(mu: float, sd: float, kept: int, total: int) -> str:
+    """Format a summary cell as 'mean ± std (kept/total)'.  When kept < total
+    the n-of-N suffix is shown so partial-run cells are visually flagged."""
+    if mu != mu:  # NaN
+        return f'    n/a ({kept}/{total})'
+    base = f'{mu/1e6:6.2f} ± {sd/1e6:5.2f}'
+    return base if kept == total else f'{base} ({kept}/{total})'
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -209,9 +241,7 @@ def main() -> int:
           f'OMP_NUM_THREADS: {args.omp_threads}   runs/cell: {args.runs}')
     print(f'Tempest mode  : GPU, {TEMPEST_KLT}, start_picker={TEMPEST_START_PICKER}, '
           f'bulk (no streaming)')
-    print('Per-dataset (wpn, mwl):')
-    for ds, (wpn, mwl) in PRESETS.items():
-        print(f'  {ds:<14} wpn={wpn:>3}  mwl={mwl:>3}  variant={TEA_VARIANT[ds]}')
+    print(f'is_directed   : {IS_DIRECTED}')
     print()
 
     results: dict = {}
@@ -236,23 +266,22 @@ def main() -> int:
         print()
 
     # ----- Side-by-side summary -----
-    print('=' * 100)
-    print('Steps/sec (×10⁶) — mean ± std')
-    print('=' * 100)
+    print('=' * 110)
+    print('Steps/sec (×10⁶) — mean ± std  (n/N suffix appears when a cell has '
+          'fewer than --runs successful runs)')
+    print('=' * 110)
     print(f'| {"dataset":<14} | {"bias":<18} | '
-          f'{"Tempest (GPU)":>16} | {"TEA (CPU)":>16} | {"speedup":>14} |')
-    print('|' + '|'.join('-' * w for w in [16, 20, 18, 18, 16]) + '|')
+          f'{"Tempest (GPU)":>22} | {"TEA (CPU)":>22} | {"speedup":>14} |')
+    print('|' + '|'.join('-' * w for w in [16, 20, 24, 24, 16]) + '|')
     for ds in PRESETS:
         cell = results.get(ds)
         if cell is None:
-            print(f'| {ds:<14} | {"(skipped)":<18} |                  |                  |                |')
+            print(f'| {ds:<14} | {"(skipped)":<18} |                        |                        |                |')
             continue
         for bias_name, _, _ in BIAS_PICKERS:
             t_sps, a_sps = cell[bias_name]
             t_mu, t_sd = mean_std(t_sps)
             a_mu, a_sd = mean_std(a_sps)
-            def fmt(mu, sd):
-                return '   n/a' if mu != mu else f'{mu/1e6:6.2f} ± {sd/1e6:5.2f}'
             if t_mu == t_mu and a_mu == a_mu and t_mu > 0:
                 ratio = a_mu / t_mu
                 ratio_s = (f'{ratio:5.2f}× TEA' if ratio >= 1.0
@@ -260,7 +289,9 @@ def main() -> int:
             else:
                 ratio_s = '         n/a'
             print(f'| {ds:<14} | {bias_name:<18} | '
-                  f'{fmt(t_mu, t_sd):>16} | {fmt(a_mu, a_sd):>16} | {ratio_s:>14} |')
+                  f'{fmt_cell(t_mu, t_sd, len(t_sps), args.runs):>22} | '
+                  f'{fmt_cell(a_mu, a_sd, len(a_sps), args.runs):>22} | '
+                  f'{ratio_s:>14} |')
     print()
     print('  "x.xx× TEA" = TEA faster; "x.xx× Tem" = Tempest faster.')
     return 0
