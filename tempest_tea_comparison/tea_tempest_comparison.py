@@ -2,6 +2,13 @@
 """
 Tempest (GPU) vs TEA-reimpl (CPU) side-by-side bulk comparison.
 
+Both engines run BACKWARD-IN-TIME walks so they sample from the same
+distribution (each picks the next edge with t < t_prev, favouring the
+most-recent past edge — closest-to-t_prev semantics, the natural
+"recent context" direction for representation-learning workloads).
+TEA-reimpl is backward-only by design; Tempest's walk_sampling_speed_test
+is invoked with walk_direction=Backward_In_Time.
+
 Runs both engines on the five datasets registered in .env (growth,
 delicious, tgbl-comment, tgbl-flight, hub-synthetic) across three
 biases (linear, exponential, temporal_node2vec), with per-dataset
@@ -18,6 +25,8 @@ Tunables on the CLI:
     --env path                .env file with dataset paths
     --runs N                  runs per (dataset, bias, engine) cell
     --timescale-bound X       exp-bias rescale, passed to both engines
+                              (default 100; keeps both engines' exp picker
+                              well-conditioned on raw unix timestamps)
     --omp-threads N           OMP_NUM_THREADS for tea_walk
 
 Hardcoded module constants (edit this file to change them):
@@ -32,7 +41,13 @@ Hardcoded module constants (edit this file to change them):
                               this is our judgement call, not a paper-
                               required value.
     TEMPEST_START_PICKER      walk_sampling_speed_test's default
-    TEMPEST_KLT               NODE_GROUPED — Tempest's headline path
+    TEMPEST_KLTS              ['FULL_WALK', 'NODE_GROUPED'] — Tempest is
+                              benchmarked under BOTH kernel-launch types;
+                              the run prints one summary table per KLT so
+                              the reader can pick the right scheduler.
+    TEMPEST_WALK_DIRECTION    Backward_In_Time — matches TEA-reimpl's
+                              hardwired backward-walk convention so the
+                              two engines sample the same distribution.
 """
 import argparse
 import os
@@ -66,7 +81,7 @@ ENV_DEFAULT = HERE / '.env'
 PRESETS = {
     #                wpn  mwl
     'growth':         (20, 80),
-    'delicious':      ( 8, 20),
+    'delicious':      ( 4, 10),   # max that fits within working-set budget
     'tgbl-comment':   (20, 80),
     'tgbl-flight':    (20, 80),
     'hub-synthetic':  (50, 80),
@@ -108,9 +123,18 @@ BIAS_PICKERS = [
 # data semantics and to stay consistent with tea_report_runtime.py
 # (which also uses 1 so the laptop figures across both scripts come
 # from the same edge interpretation).
-IS_DIRECTED          = 1
-TEMPEST_START_PICKER = 'ExponentialWeight'     # walk_sampling_speed_test default
-TEMPEST_KLT          = 'NODE_GROUPED'
+IS_DIRECTED            = 1
+TEMPEST_START_PICKER   = 'ExponentialWeight'     # walk_sampling_speed_test default
+# Tempest is benchmarked under BOTH kernel-launch types and reported in
+# two separate summary tables; the user can pick whichever scheduler is
+# best for the their workload.  NODE_GROUPED is Tempest's headline path;
+# FULL_WALK is the simpler per-walk dispatch the paper compares against.
+TEMPEST_KLTS           = ['FULL_WALK', 'NODE_GROUPED']
+# Walks go BACKWARD-IN-TIME in both engines.  TEA-reimpl is backward-only;
+# Tempest is told to run backward via this CLI arg.  Both engines then
+# favour edges with t < t_prev (closest-to-t_prev going backward = the
+# most-recent past edge), so the sampling distributions are aligned.
+TEMPEST_WALK_DIRECTION = 'Backward_In_Time'
 
 # ---------------------------------------------------------------------------
 # stdout parsers
@@ -143,16 +167,17 @@ def first_existing(paths):
     return next((p for p in paths if p.is_file()), None)
 
 
-def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale):
+def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt):
     cmd = [
         str(tempest_bin), data_path,
         '1',                     # use_gpu
         str(IS_DIRECTED),
         '-1',                    # num_total_walks (ignored when wpn != -1)
         str(wpn), str(mwl),
-        picker, TEMPEST_START_PICKER, TEMPEST_KLT,
+        picker, TEMPEST_START_PICKER, klt,
         '',                      # walk_dump_file (empty = skip)
         str(timescale),
+        TEMPEST_WALK_DIRECTION,  # match TEA-reimpl's backward-only convention
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -215,9 +240,14 @@ def main() -> int:
                     help=f'.env with dataset paths (default: {ENV_DEFAULT})')
     ap.add_argument('--runs', type=int, default=3,
                     help='runs per (dataset, bias, engine) cell (default: 3)')
-    ap.add_argument('--timescale-bound', type=float, default=-1.0,
+    ap.add_argument('--timescale-bound', type=float, default=100.0,
                     help='exp-bias rescale passed to both engines '
-                         '(default: -1, paper-strict)')
+                         '(default: 100).  Keeps the exp picker numerically '
+                         'well-conditioned on raw unix timestamps: TEA '
+                         'underflows old edges and Tempest overflows recent '
+                         'edges at timescale_bound=-1, so the two engines '
+                         'diverge.  Any sane positive value (~30-100) aligns '
+                         'them; 100 leaves headroom for high-span datasets.')
     ap.add_argument('--omp-threads', type=int, default=os.cpu_count() or 16,
                     help='OMP_NUM_THREADS for tea_walk (default: nproc)')
     args = ap.parse_args()
@@ -239,11 +269,16 @@ def main() -> int:
     print(f'TEA bin       : {TEA_BIN}')
     print(f'timescale_bound : {args.timescale_bound}   '
           f'OMP_NUM_THREADS: {args.omp_threads}   runs/cell: {args.runs}')
-    print(f'Tempest mode  : GPU, {TEMPEST_KLT}, start_picker={TEMPEST_START_PICKER}, '
-          f'bulk (no streaming)')
+    print(f'Tempest KLTs  : {", ".join(TEMPEST_KLTS)}  '
+          f'(reported in separate tables)')
+    print(f'Tempest start picker: {TEMPEST_START_PICKER}')
+    print(f'walk direction: {TEMPEST_WALK_DIRECTION} (TEA-reimpl is backward-only)')
     print(f'is_directed   : {IS_DIRECTED}')
     print()
 
+    # results[ds][bias_name] = (tempest_sps_by_klt, tea_sps)
+    #   tempest_sps_by_klt: {klt: [sps,...]}
+    #   tea_sps          : [sps,...]
     results: dict = {}
     for ds, (wpn, mwl) in PRESETS.items():
         data_path = env.get(ENV_KEY[ds])
@@ -256,44 +291,54 @@ def main() -> int:
         results[ds] = {}
         for bias_name, tempest_picker, tea_picker in BIAS_PICKERS:
             print(f'  bias={bias_name}')
-            t_sps = repeat(args.runs, 'Tempest', run_tempest,
-                           tempest_bin, data_path, tempest_picker,
-                           wpn, mwl, args.timescale_bound)
+            tempest_sps_by_klt = {}
+            for klt in TEMPEST_KLTS:
+                tempest_sps_by_klt[klt] = repeat(
+                    args.runs, f'Tempest [{klt:<12}]', run_tempest,
+                    tempest_bin, data_path, tempest_picker,
+                    wpn, mwl, args.timescale_bound, klt)
             a_sps = repeat(args.runs, 'TEA    ', run_tea,
                            TEA_BIN, data_path, tea_picker, variant,
                            wpn, mwl, args.timescale_bound, args.omp_threads)
-            results[ds][bias_name] = (t_sps, a_sps)
+            results[ds][bias_name] = (tempest_sps_by_klt, a_sps)
         print()
 
-    # ----- Side-by-side summary -----
-    print('=' * 110)
-    print('Steps/sec (×10⁶) — mean ± std  (n/N suffix appears when a cell has '
-          'fewer than --runs successful runs)')
-    print('=' * 110)
-    print(f'| {"dataset":<14} | {"bias":<18} | '
-          f'{"Tempest (GPU)":>22} | {"TEA (CPU)":>22} | {"speedup":>14} |')
-    print('|' + '|'.join('-' * w for w in [16, 20, 24, 24, 16]) + '|')
-    for ds in PRESETS:
-        cell = results.get(ds)
-        if cell is None:
-            print(f'| {ds:<14} | {"(skipped)":<18} |                        |                        |                |')
-            continue
-        for bias_name, _, _ in BIAS_PICKERS:
-            t_sps, a_sps = cell[bias_name]
-            t_mu, t_sd = mean_std(t_sps)
-            a_mu, a_sd = mean_std(a_sps)
-            if t_mu == t_mu and a_mu == a_mu and t_mu > 0:
-                ratio = a_mu / t_mu
-                ratio_s = (f'{ratio:5.2f}× TEA' if ratio >= 1.0
-                           else f'{1.0/ratio:5.2f}× Tem')
-            else:
-                ratio_s = '         n/a'
-            print(f'| {ds:<14} | {bias_name:<18} | '
-                  f'{fmt_cell(t_mu, t_sd, len(t_sps), args.runs):>22} | '
-                  f'{fmt_cell(a_mu, a_sd, len(a_sps), args.runs):>22} | '
-                  f'{ratio_s:>14} |')
-    print()
-    print('  "x.xx× TEA" = TEA faster; "x.xx× Tem" = Tempest faster.')
+    # ----- One summary table per Tempest KLT -----
+    def render_table(klt: str):
+        print('=' * 110)
+        print(f'Tempest [{klt}] vs TEA-reimpl — steps/sec (×10⁶), mean ± std  '
+              '(n/N suffix when partial cell)')
+        print('=' * 110)
+        print(f'| {"dataset":<14} | {"bias":<18} | '
+              f'{"Tempest (GPU)":>22} | {"TEA (CPU)":>22} | {"speedup":>14} |')
+        print('|' + '|'.join('-' * w for w in [16, 20, 24, 24, 16]) + '|')
+        for ds in PRESETS:
+            cell = results.get(ds)
+            if cell is None:
+                print(f'| {ds:<14} | {"(skipped)":<18} |                        '
+                      f'|                        |                |')
+                continue
+            for bias_name, _, _ in BIAS_PICKERS:
+                tempest_sps_by_klt, a_sps = cell[bias_name]
+                t_sps = tempest_sps_by_klt.get(klt, [])
+                t_mu, t_sd = mean_std(t_sps)
+                a_mu, a_sd = mean_std(a_sps)
+                if t_mu == t_mu and a_mu == a_mu and t_mu > 0:
+                    ratio = a_mu / t_mu
+                    ratio_s = (f'{ratio:5.2f}× TEA' if ratio >= 1.0
+                               else f'{1.0/ratio:5.2f}× Tem')
+                else:
+                    ratio_s = '         n/a'
+                print(f'| {ds:<14} | {bias_name:<18} | '
+                      f'{fmt_cell(t_mu, t_sd, len(t_sps), args.runs):>22} | '
+                      f'{fmt_cell(a_mu, a_sd, len(a_sps), args.runs):>22} | '
+                      f'{ratio_s:>14} |')
+        print()
+        print('  "x.xx× TEA" = TEA faster; "x.xx× Tem" = Tempest faster.')
+        print()
+
+    for klt in TEMPEST_KLTS:
+        render_table(klt)
     return 0
 
 
