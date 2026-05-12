@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Tempest (GPU) vs TEA-reimpl (CPU) side-by-side comparison across four
-datasets and three biases.
+Tempest (GPU) vs TEA-reimpl (CPU) side-by-side comparison across the
+five datasets registered in .env (growth, delicious, tgbl-comment,
+tgbl-flight, hub-synthetic), three biases each (linear, exponential,
+temporal_node2vec), with per-dataset walk presets.
 
-Runs both engines on the same data with matching walk parameters,
-collects steps/sec across multiple repeats, and prints mean ± std per
-(dataset, bias, engine) cell.  Tempest is invoked in bulk (single
-ingest, single walk pass — no streaming batches/windows).
+Both engines are driven in bulk (single ingest, single walk pass — no
+streaming batches/windows; Tempest's ablation_runner nb/nw knobs are
+streaming-only and don't apply here).  Every tunable parameter is a
+CLI flag — pass --help to see them.
 
 Tempest binary  : ../../temporal-random-walk/build/bin/walk_sampling_speed_test
+                  (also looks at ../cmake-build-debug/bin/ as a fallback,
+                  since CLion default builds there).
 TEA binary      : ../../tea-reimpl/build/tea_walk
-Datasets        : growth, delicious, ml_tgbl-comment, ml_tgbl-flight (.env)
-Biases          : linear, exponential, temporal_node2vec
-Engines         : Tempest (GPU, NODE_GROUPED), TEA (CPU, tea_hpat/tea_pat)
 """
+import argparse
 import os
 import re
 import statistics
@@ -29,63 +31,72 @@ TEA_REIMPL  = HERE.parent.parent / 'tea-reimpl'
 TRW         = HERE.parent.parent / 'temporal-random-walk'
 TEA_BIN     = TEA_REIMPL / 'build' / 'tea_walk'
 
-# walk_sampling_speed_test landing point depends on which build dir
-# was used.  Look at the standard build/ first; fall back to
-# cmake-build-debug (CLion default, despite the name it builds Release).
 TEMPEST_BIN_CANDIDATES = [
     TRW / 'build' / 'bin' / 'walk_sampling_speed_test',
     TRW / 'cmake-build-debug' / 'bin' / 'walk_sampling_speed_test',
 ]
-
-ENV_PATH = HERE / '.env'
+ENV_DEFAULT = HERE / '.env'
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Per-dataset walk presets — single source of truth, mirrors the
+# ablation_runner constants.py 4-tuple shape (wpn, num_batches, num_windows,
+# max_walk_len).  The bulk walk_sampling_speed_test ignores num_batches /
+# num_windows (those are streaming-only knobs in ablation_streaming); we
+# carry them for transparency / cross-script consistency.
+#
+# growth/delicious values follow the ablation_runner conventions for the
+# corresponding TEA paper Table 4 rows; tgbl-* follow ablation_runner's
+# 4-dataset preset row from constants.py; hub-synthetic uses the laptop
+# config recommended in temporal-random-walk/synthetic_data_generator/
+# README.txt (wpn=50 / mwl=80 for an 8 GB GPU; the README's A40 recipe is
+# wpn=500 / mwl=100, which OOMs a laptop).
 # ---------------------------------------------------------------------------
-# Tempest's walk_sampling_speed_test hardcodes timescale_bound=34; match
-# it on TEA so both engines sample from the same exp distribution.
-WALKS_PER_NODE   = 1                 # wpn=1 fits an 8 GB laptop GPU
-MAX_WALK_LEN     = 80
-IS_DIRECTED      = 1
-TIMESCALE_BOUND  = 34                # Tempest's hardcoded default
-RUNS_PER_CELL    = 3
-OMP_THREADS      = '16'
+DATASET_PRESETS_DEFAULT = {
+    # (wpn, num_batches, num_windows, max_walk_len)
+    'growth':         (10,  1,  1, 80),
+    'delicious':      ( 8, 30, 13, 10),
+    'tgbl-comment':   (20,  4,  1, 80),
+    'tgbl-flight':    (20,  4,  1, 80),
+    'hub-synthetic':  (50,  1,  1, 80),
+}
 
-# Tempest bulk-mode knobs.  walk_sampling_speed_test does single-ingest /
-# single-walk-pass by construction, so "batches=1, window=1" is the
-# semantic — no streaming, no sliding window.
-TEMPEST_START_PICKER = 'ExponentialWeight'
-TEMPEST_KLT          = 'NODE_GROUPED'
+# label → env-var key.  Centralized so the script doesn't carry hardcoded
+# paths anywhere — every dataset is resolved through .env.
+ENV_KEY_MAP_DEFAULT = {
+    'growth':         'GROWTH_PATH',
+    'delicious':      'DELICIOUS_PATH',
+    'tgbl-comment':   'TGBL_COMMENT_PATH',
+    'tgbl-flight':    'TGBL_FLIGHT_PATH',
+    'hub-synthetic':  'HUB_SYNTHETIC_PATH',
+}
 
-# bias-name → (tempest picker, tea picker) mapping.
+# TEA variant per dataset.  tea_pat is the memory-bound fallback the paper
+# §3.2 describes for graphs whose HPAT+aux footprint overflows DRAM
+# (delicious on a 24 GB laptop).
+TEA_VARIANT_DEFAULT = {
+    'growth':         'tea_hpat',
+    'delicious':      'tea_pat',
+    'tgbl-comment':   'tea_hpat',
+    'tgbl-flight':    'tea_hpat',
+    'hub-synthetic':  'tea_hpat',
+}
+
+# (display label, Tempest picker enum string, TEA picker string)
 BIAS_PICKERS = [
     ('linear',            'Linear',            'linear'),
     ('exponential',       'ExponentialWeight', 'exponential'),
     ('temporal_node2vec', 'TemporalNode2Vec',  'temporal_node2vec'),
 ]
 
-DATASETS = [
-    # (label, env-key, tea_variant)
-    # delicious's HPAT footprint overflows a 24 GB laptop; the paper
-    # §3.2 itself describes PAT as the memory-bound fallback.
-    ('growth',         'GROWTH_PATH',         'tea_hpat'),
-    ('delicious',      'DELICIOUS_PATH',      'tea_pat'),
-    ('tgbl-comment',   'TGBL_COMMENT_PATH',   'tea_hpat'),
-    ('tgbl-flight',    'TGBL_FLIGHT_PATH',    'tea_hpat'),
-    ('hub-synthetic',  'HUB_SYNTHETIC_PATH',  'tea_hpat'),
-]
-
 # ---------------------------------------------------------------------------
 # stdout parsers
 # ---------------------------------------------------------------------------
-# tea_walk
-TEA_SPS_RE   = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)\s+steps/sec', re.MULTILINE)
-TEA_WPS_RE   = re.compile(r'^Throughput:\s+([\d.eE+-]+)\s+walks/sec', re.MULTILINE)
-TEA_AVL_RE   = re.compile(r'^Final avg walk length:\s+([\d.eE+-]+)', re.MULTILINE)
-# walk_sampling_speed_test
-TEMP_SPS_RE  = re.compile(r'^\s*Steps/sec:\s+([\d.eE+-]+)', re.MULTILINE)
-TEMP_WPS_RE  = re.compile(r'^\s*Walks/sec:\s+([\d.eE+-]+)', re.MULTILINE)
-TEMP_AVL_RE  = re.compile(r'^Average walk length:\s+([\d.eE+-]+)', re.MULTILINE)
+TEA_SPS_RE  = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)\s+steps/sec',     re.MULTILINE)
+TEA_WPS_RE  = re.compile(r'^Throughput:\s+([\d.eE+-]+)\s+walks/sec',    re.MULTILINE)
+TEA_AVL_RE  = re.compile(r'^Final avg walk length:\s+([\d.eE+-]+)',     re.MULTILINE)
+TEMP_SPS_RE = re.compile(r'^\s*Steps/sec:\s+([\d.eE+-]+)',              re.MULTILINE)
+TEMP_WPS_RE = re.compile(r'^\s*Walks/sec:\s+([\d.eE+-]+)',              re.MULTILINE)
+TEMP_AVL_RE = re.compile(r'^Average walk length:\s+([\d.eE+-]+)',       re.MULTILINE)
 
 
 def load_env(path: Path) -> dict:
@@ -107,25 +118,27 @@ def grab(rx: re.Pattern, tag: str, text: str) -> float:
     return float(m.group(1))
 
 
-def first_existing(paths: list[Path]) -> Path | None:
+def first_existing(paths):
     for p in paths:
         if p.is_file():
             return p
     return None
 
 
-def run_tempest(binary: Path, data_path: str, tempest_picker: str) -> dict:
+def run_tempest(args, binary, data_path, tempest_picker, wpn, mwl):
     """One walk_sampling_speed_test invocation (GPU, bulk)."""
     cmd = [
         str(binary), data_path,
-        '1',                          # use_gpu
-        str(IS_DIRECTED),             # is_directed
-        '-1',                         # num_total_walks (ignored when wpn != -1)
-        str(WALKS_PER_NODE),
-        str(MAX_WALK_LEN),
-        tempest_picker,               # edge_picker
-        TEMPEST_START_PICKER,
-        TEMPEST_KLT,
+        '1',                                       # use_gpu
+        str(int(args.is_directed)),
+        '-1',                                      # num_total_walks (ignored when wpn != -1)
+        str(wpn),
+        str(mwl),
+        tempest_picker,
+        args.tempest_start_picker,
+        args.tempest_klt,
+        '',                                        # walk_dump_file (empty = skip)
+        str(args.timescale_bound),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -139,14 +152,16 @@ def run_tempest(binary: Path, data_path: str, tempest_picker: str) -> dict:
     }
 
 
-def run_tea(data_path: str, bias: str, variant: str) -> dict:
+def run_tea(args, data_path, bias, variant, wpn, mwl):
     """One tea_walk invocation (CPU)."""
     cmd = [
-        str(TEA_BIN), data_path, bias, variant,
-        str(IS_DIRECTED), str(WALKS_PER_NODE),
-        str(MAX_WALK_LEN), str(TIMESCALE_BOUND),
+        str(args.tea_binary), data_path, bias, variant,
+        str(int(args.is_directed)),
+        str(wpn),
+        str(mwl),
+        str(args.timescale_bound),
     ]
-    env = {**os.environ, 'OMP_NUM_THREADS': OMP_THREADS}
+    env = {**os.environ, 'OMP_NUM_THREADS': str(args.omp_threads)}
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -159,14 +174,12 @@ def run_tea(data_path: str, bias: str, variant: str) -> dict:
     }
 
 
-def repeat(label_prefix: str, runner, *args) -> list[float]:
-    """Call `runner(*args)` RUNS_PER_CELL times; return list of steps/sec.
-    Failures are logged and skipped (the cell still reports the kept runs)."""
+def repeat(args, label_prefix, runner, *runner_args):
     sps = []
-    for i in range(1, RUNS_PER_CELL + 1):
-        print(f'    {label_prefix} run {i}/{RUNS_PER_CELL} ...', end=' ', flush=True)
+    for i in range(1, args.runs + 1):
+        print(f'    {label_prefix} run {i}/{args.runs} ...', end=' ', flush=True)
         try:
-            r = runner(*args)
+            r = runner(*runner_args)
         except RuntimeError as e:
             short = str(e).splitlines()[0]
             print(f'FAIL ({short})')
@@ -177,7 +190,7 @@ def repeat(label_prefix: str, runner, *args) -> list[float]:
     return sps
 
 
-def mean_std(xs: list[float]) -> tuple[float, float]:
+def mean_std(xs):
     if not xs:
         return float('nan'), float('nan')
     mu = statistics.mean(xs)
@@ -185,85 +198,175 @@ def mean_std(xs: list[float]) -> tuple[float, float]:
     return mu, sd
 
 
+def parse_preset_override(s: str):
+    """Parse 'growth=10,80 delicious=8,10' into {'growth': (10, 80), ...}.
+
+    Only wpn,mwl pairs — nb/nw aren't tunable for the bulk binary.
+    """
+    out = {}
+    for entry in re.split(r'[ ,;]+\s*(?=\w+=)|\s+', s.strip()):
+        entry = entry.strip()
+        if not entry:
+            continue
+        k, _, v = entry.partition('=')
+        parts = [p.strip() for p in v.split(',')]
+        if len(parts) < 2:
+            raise argparse.ArgumentTypeError(
+                f'preset override {entry!r} needs wpn,mwl (got {v!r})')
+        out[k.strip()] = (int(parts[0]), int(parts[1]))
+    return out
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument('--env', type=Path, default=ENV_DEFAULT,
+                   help=f'.env file with dataset paths (default: {ENV_DEFAULT})')
+    p.add_argument('--tea-binary', type=Path, default=TEA_BIN,
+                   help=f'Path to tea_walk binary (default: {TEA_BIN})')
+    p.add_argument('--tempest-binary', type=Path,
+                   default=None,
+                   help='Path to walk_sampling_speed_test (default: tries '
+                        f'{TEMPEST_BIN_CANDIDATES[0]} then '
+                        f'{TEMPEST_BIN_CANDIDATES[1]})')
+    p.add_argument('--datasets', type=lambda s: tuple(d.strip() for d in s.split(',')),
+                   default=tuple(DATASET_PRESETS_DEFAULT.keys()),
+                   help='Comma-separated datasets to run (default: all five)')
+    p.add_argument('--biases',
+                   type=lambda s: tuple(b.strip() for b in s.split(',')),
+                   default=tuple(name for name, _, _ in BIAS_PICKERS),
+                   help='Comma-separated biases to run '
+                        '(default: linear,exponential,temporal_node2vec)')
+    p.add_argument('--runs', type=int, default=3,
+                   help='Number of runs per (dataset, bias, engine) cell '
+                        '(default: 3)')
+    p.add_argument('--is-directed', type=int, default=1, choices=(0, 1),
+                   help='Treat graphs as directed (default: 1)')
+    p.add_argument('--timescale-bound', type=float, default=-1.0,
+                   help='Exponential-bias timescale rescale, passed to both '
+                        'engines so they sample from the same distribution. '
+                        "-1 = strict-paper TEA (raw exp(t_i) with cancellation). "
+                        '(default: -1)')
+    p.add_argument('--omp-threads', type=int, default=os.cpu_count() or 16,
+                   help='OMP_NUM_THREADS for tea_walk (default: nproc)')
+    p.add_argument('--tempest-start-picker', default='ExponentialWeight',
+                   help='Tempest first-hop picker (default: ExponentialWeight, '
+                        "the walk_sampling_speed_test default)")
+    p.add_argument('--tempest-klt', default='NODE_GROUPED',
+                   choices=('NODE_GROUPED', 'FULL_WALK', 'NODE_GROUPED_GLOBAL_ONLY'),
+                   help='Tempest kernel launch type (default: NODE_GROUPED)')
+    p.add_argument('--preset-override', type=parse_preset_override, default={},
+                   help='Override per-dataset (wpn,mwl) presets.  '
+                        "Example: 'growth=10,80 delicious=8,10'.")
+    return p.parse_args()
+
+
 def main() -> int:
-    tempest_bin = first_existing(TEMPEST_BIN_CANDIDATES)
-    if tempest_bin is None:
-        sys.stderr.write('ERROR: Tempest walk_sampling_speed_test binary not found.\n'
-                         f'  Looked at:\n')
-        for p in TEMPEST_BIN_CANDIDATES:
-            sys.stderr.write(f'    {p}\n')
+    args = parse_args()
+    if not Path(args.tea_binary).is_file():
+        sys.stderr.write(f'ERROR: TEA binary not found at {args.tea_binary}\n')
         return 1
-    if not TEA_BIN.is_file():
-        sys.stderr.write(f'ERROR: TEA binary not found at {TEA_BIN}\n')
+    tempest_bin = (
+        Path(args.tempest_binary)
+        if args.tempest_binary
+        else first_existing(TEMPEST_BIN_CANDIDATES)
+    )
+    if tempest_bin is None or not tempest_bin.is_file():
+        sys.stderr.write('ERROR: Tempest walk_sampling_speed_test binary not found\n')
         return 1
-    if not ENV_PATH.is_file():
-        sys.stderr.write(f'ERROR: env file not found at {ENV_PATH}\n')
+    if not args.env.is_file():
+        sys.stderr.write(f'ERROR: env file not found at {args.env}\n')
         return 1
-    env = load_env(ENV_PATH)
+    env = load_env(args.env)
+
+    # Resolve presets (default + overrides) per dataset.
+    def preset_for(ds: str):
+        wpn0, nb, nw, mwl0 = DATASET_PRESETS_DEFAULT[ds]
+        if ds in args.preset_override:
+            wpn0, mwl0 = args.preset_override[ds]
+        return wpn0, nb, nw, mwl0
 
     print('=== Tempest (GPU) vs TEA-reimpl (CPU) — bulk steps/sec ===')
     print(f'Tempest bin   : {tempest_bin}')
-    print(f'TEA bin       : {TEA_BIN}')
-    print(f'Params        : wpn={WALKS_PER_NODE}, max_walk_len={MAX_WALK_LEN}, '
-          f'timescale_bound={TIMESCALE_BOUND}, OMP_NUM_THREADS={OMP_THREADS}')
-    print(f'Runs/cell     : {RUNS_PER_CELL}')
-    print(f'Tempest mode  : GPU, {TEMPEST_KLT}, start_picker={TEMPEST_START_PICKER} '
-          f'(bulk: batches=1, window=1)')
+    print(f'TEA bin       : {args.tea_binary}')
+    print(f'timescale_bound : {args.timescale_bound}   '
+          f'OMP_NUM_THREADS: {args.omp_threads}   runs/cell: {args.runs}')
+    print(f'Tempest mode  : GPU, {args.tempest_klt}, '
+          f'start_picker={args.tempest_start_picker} (bulk: batches=1, window=1)')
+    print('Per-dataset presets (wpn / mwl):')
+    for ds in args.datasets:
+        wpn, _, _, mwl = preset_for(ds)
+        print(f'  {ds:<14} wpn={wpn:>3}  mwl={mwl:>3}  '
+              f'variant={TEA_VARIANT_DEFAULT[ds]}')
     print()
 
-    # results[ds_label][bias_name] = {'tempest': [...], 'tea': [...]}
+    # results[ds][bias] = {'tempest': [...sps...], 'tea': [...sps...]}
     results: dict = {}
 
-    for ds_label, env_key, tea_variant in DATASETS:
+    for ds in args.datasets:
+        env_key = ENV_KEY_MAP_DEFAULT.get(ds)
+        if env_key is None:
+            print(f'  [skip] {ds}: no env-key mapping')
+            results[ds] = None
+            continue
         data_path = env.get(env_key)
         if not data_path or not Path(data_path).is_file():
-            print(f'  [skip] {ds_label}: dataset path missing ({env_key}={data_path!r})')
-            results[ds_label] = None
+            print(f'  [skip] {ds}: dataset missing ({env_key}={data_path!r})')
+            results[ds] = None
             continue
-        print(f'--- {ds_label}  ({data_path})  TEA variant: {tea_variant} ---')
-        results[ds_label] = {}
+        wpn, _nb, _nw, mwl = preset_for(ds)
+        variant = TEA_VARIANT_DEFAULT[ds]
+        print(f'--- {ds}  ({data_path})  wpn={wpn} mwl={mwl} variant={variant} ---')
+        results[ds] = {}
 
         for bias_name, tempest_picker, tea_picker in BIAS_PICKERS:
+            if bias_name not in args.biases:
+                continue
             print(f'  bias={bias_name}')
-            tempest_sps = repeat('Tempest', run_tempest, tempest_bin,
-                                 data_path, tempest_picker)
-            tea_sps     = repeat('TEA    ', run_tea,
-                                 data_path, tea_picker, tea_variant)
-            results[ds_label][bias_name] = {'tempest': tempest_sps, 'tea': tea_sps}
+            tempest_sps = repeat(args, 'Tempest', run_tempest,
+                                 args, tempest_bin, data_path, tempest_picker, wpn, mwl)
+            tea_sps     = repeat(args, 'TEA    ', run_tea,
+                                 args, data_path, tea_picker, variant, wpn, mwl)
+            results[ds][bias_name] = {'tempest': tempest_sps, 'tea': tea_sps}
         print()
 
     # ----- Side-by-side summary -----
-    print('=' * 100)
+    print('=' * 110)
     print('Steps/sec (×10⁶) — mean ± std across kept runs')
-    print('=' * 100)
-    print(f'| {"dataset":<13} | {"bias":<18} | '
-          f'{"Tempest (GPU)":>16} | {"TEA (CPU)":>16} | {"speedup":>10} |')
-    print('|' + '|'.join('-' * w for w in [15, 20, 18, 18, 12]) + '|')
+    print('=' * 110)
+    print(f'| {"dataset":<14} | {"bias":<18} | '
+          f'{"Tempest (GPU)":>16} | {"TEA (CPU)":>16} | {"speedup":>14} |')
+    print('|' + '|'.join('-' * w for w in [16, 20, 18, 18, 16]) + '|')
 
-    for ds_label, _, _ in DATASETS:
-        cell = results.get(ds_label)
+    for ds in args.datasets:
+        cell = results.get(ds)
         if cell is None:
-            print(f'| {ds_label:<13} | {"(dataset missing)":<18} | '
-                  f'{"":>16} | {"":>16} | {"":>10} |')
+            print(f'| {ds:<14} | {"(skipped)":<18} |                  |                  |               |')
             continue
         for bias_name, _, _ in BIAS_PICKERS:
-            tempest_sps = cell[bias_name]['tempest']
-            tea_sps     = cell[bias_name]['tea']
-            t_mu, t_sd  = mean_std(tempest_sps)
-            a_mu, a_sd  = mean_std(tea_sps)
+            if bias_name not in args.biases:
+                continue
+            entry = cell.get(bias_name)
+            if entry is None:
+                continue
+            t_mu, t_sd = mean_std(entry['tempest'])
+            a_mu, a_sd = mean_std(entry['tea'])
 
             def fmt(mu: float, sd: float) -> str:
-                if mu != mu:                            # NaN
+                if mu != mu:  # NaN
                     return '   n/a'
                 return f'{mu/1e6:6.2f} ± {sd/1e6:5.2f}'
 
             if t_mu == t_mu and a_mu == a_mu and t_mu > 0:
                 ratio = a_mu / t_mu
-                ratio_s = f'{ratio:5.2f}× TEA' if ratio >= 1.0 else f'{1.0/ratio:5.2f}× Tem'
+                ratio_s = (f'{ratio:5.2f}× TEA' if ratio >= 1.0
+                           else f'{1.0/ratio:5.2f}× Tem')
             else:
                 ratio_s = '       n/a'
-            print(f'| {ds_label:<13} | {bias_name:<18} | '
-                  f'{fmt(t_mu, t_sd):>16} | {fmt(a_mu, a_sd):>16} | {ratio_s:>10} |')
+            print(f'| {ds:<14} | {bias_name:<18} | '
+                  f'{fmt(t_mu, t_sd):>16} | {fmt(a_mu, a_sd):>16} | {ratio_s:>14} |')
     print()
     print('  speedup column reads "x.xx× TEA" when TEA is faster,')
     print('                       "x.xx× Tem" when Tempest is faster.')
