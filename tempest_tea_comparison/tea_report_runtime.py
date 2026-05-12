@@ -74,7 +74,7 @@ OMP_THREADS     = 16
 DATASETS = (
     # (label, env-key, tea_variant, max_walk_len)
     ('growth',    'GROWTH_PATH',    'tea_hpat', 80),
-    ('delicious', 'DELICIOUS_PATH', 'tea_pat',  20),
+    ('delicious', 'DELICIOUS_PATH', 'tea_pat',  80),
 )
 
 # Bias name → tea_walk picker string.
