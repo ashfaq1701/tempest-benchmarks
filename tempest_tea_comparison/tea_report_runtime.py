@@ -10,7 +10,17 @@ to run our reimplementation under the paper's stated experimental
 config — exactly.  So the paper-defining parameters are hardcoded:
 
     walks_per_node  = 10        (DeepWalk/CTDNE default, paper §5.1)
-    max_walk_len    = 80        (paper §5.1: "default walk length of 80")
+    max_walk_len    = 80 for growth, 20 for delicious
+                                (paper §5.1 default is 80, but delicious
+                                 has 33.8M vertices: a 33.8M × 10 × 80 ×
+                                 16 B output buffer is ≈ 433 GB, which
+                                 OOMs any single-node box.  Walks on
+                                 delicious die at avg length ≈ 2.16
+                                 under exp-bias and ≈ 2.16 under linear
+                                 anyway — mwl=20 is more than enough
+                                 to never truncate a real walk, and the
+                                 output-buffer footprint drops to ~108 GB
+                                 which fits a server.)
     timescale_bound = -1        (paper §2.3.II Eq 3: pure exp(t_i) with
                                  the t_cur cancellation, no rescale)
     is_directed     = 1         (paper §2.1 walk model is directed)
@@ -43,18 +53,28 @@ ENV_DEFAULT = HERE / '.env'
 # TEA paper §5.1 experimental config — hardcoded by design (see module docstring).
 # ---------------------------------------------------------------------------
 WALKS_PER_NODE  = 10
-MAX_WALK_LEN    = 80
 TIMESCALE_BOUND = -1.0
 IS_DIRECTED     = 1
 OMP_THREADS     = 16
 
 # Datasets: the two in-memory rows of paper Table 4 the laptop can run.
+# Each entry is (label, env-key, tea_variant, max_walk_len).
+#
 # tea_pat is the memory-bound fallback for delicious (paper §3.2 describes
 # PAT as the fallback when HPAT's footprint overflows DRAM).
+#
+# delicious's max_walk_len is 20 instead of the paper-default 80 because
+# the walks_out buffer scales as num_walks × max_walk_len × sizeof(NodeStep).
+# With 33.78M active vertices × wpn=10 × 80 × 16 B = ≈ 433 GB it OOMs
+# every single-node box; at mwl=20 it's ≈ 108 GB and fits a server.
+# Walks on delicious die at avg length ≈ 2.16 under every bias anyway,
+# so mwl=20 is well above the longest real walk and the science is
+# unchanged.  growth uses the paper-default mwl=80 (its avg ≈ 4.31
+# under linear and 3.13 under exp, so 80 is plenty of headroom there).
 DATASETS = (
-    # (label, env-key, tea_variant)
-    ('growth',    'GROWTH_PATH',    'tea_hpat'),
-    ('delicious', 'DELICIOUS_PATH', 'tea_pat'),
+    # (label, env-key, tea_variant, max_walk_len)
+    ('growth',    'GROWTH_PATH',    'tea_hpat', 80),
+    ('delicious', 'DELICIOUS_PATH', 'tea_pat',  20),
 )
 
 # Bias name → tea_walk picker string.
@@ -92,12 +112,12 @@ def grab(rx: re.Pattern, tag: str, text: str) -> float:
     return float(m.group(1))
 
 
-def run_tea(data_path: str, bias: str, variant: str) -> dict:
+def run_tea(data_path: str, bias: str, variant: str, max_walk_len: int) -> dict:
     cmd = [
         str(TEA_BIN), data_path, bias, variant,
         str(IS_DIRECTED),
         str(WALKS_PER_NODE),
-        str(MAX_WALK_LEN),
+        str(max_walk_len),
         str(TIMESCALE_BOUND),
     ]
     env = {**os.environ, 'OMP_NUM_THREADS': str(OMP_THREADS)}
@@ -131,14 +151,14 @@ def main() -> int:
 
     print('=== TEA paper Table 4 reproduction ===')
     print(f'Binary    : {TEA_BIN}')
-    print(f'Paper cfg : wpn={WALKS_PER_NODE}, max_walk_len={MAX_WALK_LEN}, '
-          f'timescale_bound={TIMESCALE_BOUND}, '
+    print(f'Paper cfg : wpn={WALKS_PER_NODE}, timescale_bound={TIMESCALE_BOUND}, '
           f'is_directed={IS_DIRECTED}, OMP_NUM_THREADS={OMP_THREADS}')
+    print(f'Per-ds mwl: ' + ', '.join(f'{ds}={mwl}' for ds, _, _, mwl in DATASETS))
     print(f'Runs/cell : {args.runs}')
     print()
 
-    results: dict = {ds: {} for ds, _, _ in DATASETS}
-    for ds, env_key, variant in DATASETS:
+    results: dict = {ds: {} for ds, _, _, _ in DATASETS}
+    for ds, env_key, variant, mwl in DATASETS:
         data_path = env.get(env_key)
         if not data_path or not Path(data_path).is_file():
             sys.stderr.write(f'ERROR: {ds} CSV not found ({env_key}={data_path!r})\n')
@@ -146,10 +166,11 @@ def main() -> int:
         for bias in BIASES:
             walk_times = []
             for run in range(1, args.runs + 1):
-                print(f'  {ds:9s} / {bias:18s} / {variant} / run {run}/{args.runs} ...',
+                print(f'  {ds:9s} / {bias:18s} / {variant} / mwl={mwl:<3} / '
+                      f'run {run}/{args.runs} ...',
                       end=' ', flush=True)
                 try:
-                    r = run_tea(data_path, bias, variant)
+                    r = run_tea(data_path, bias, variant, mwl)
                 except RuntimeError as e:
                     print(f'FAIL ({e})')
                     continue
@@ -168,7 +189,7 @@ def main() -> int:
           f'{"paper":>7} | {"r1":>7} | {"r2":>7} | {"r3":>7} | '
           f'{"median":>7} | {"ratio":>7} |')
     print('|' + '|'.join('-' * w for w in [12, 20, 9, 9, 9, 9, 9, 9]) + '|')
-    for ds, _, _ in DATASETS:
+    for ds, _, _, _ in DATASETS:
         for bias in BIASES:
             paper  = PAPER_TABLE4[ds][bias]
             runs   = results[ds].get(bias, [])
