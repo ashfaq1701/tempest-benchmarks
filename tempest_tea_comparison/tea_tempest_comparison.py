@@ -139,10 +139,22 @@ TEMPEST_WALK_DIRECTION = 'Backward_In_Time'
 # ---------------------------------------------------------------------------
 # stdout parsers
 # ---------------------------------------------------------------------------
-TEA_SPS_RE  = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)\s+steps/sec',     re.MULTILINE)
-TEA_AVL_RE  = re.compile(r'^Final avg walk length:\s+([\d.eE+-]+)',     re.MULTILINE)
-TEMP_SPS_RE = re.compile(r'^\s*Steps/sec:\s+([\d.eE+-]+)',              re.MULTILINE)
-TEMP_AVL_RE = re.compile(r'^Average walk length:\s+([\d.eE+-]+)',       re.MULTILINE)
+# TEA's tea_walk reports its own walk-loop elapsed time on the
+# "Walks done:" line — that bracket is already compute-only (the
+# inner OpenMP loop), so it's the direct analog of Tempest's
+# "Walk time" below.
+TEA_SPS_RE     = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)\s+steps/sec',  re.MULTILINE)
+TEA_AVL_RE     = re.compile(r'^Final avg walk length:\s+([\d.eE+-]+)',  re.MULTILINE)
+TEA_WALK_RE    = re.compile(r'^Walks done:\s+\d+\s+\(([\d.eE+-]+)\s+s\)', re.MULTILINE)
+# Tempest's walk_sampling_speed_test now reports both:
+#   Wall time : full call-site bracket (alloc + start-list + kernels + sync + D2H)
+#   Walk time : compute-only (kernels + sync, after alloc/start-list and before D2H)
+# Steps/sec is computed against Walk time and is the apples-to-apples
+# figure vs TEA's reported walk_loop elapsed.
+TEMP_SPS_RE    = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)',              re.MULTILINE)
+TEMP_AVL_RE    = re.compile(r'^Average walk length:\s+([\d.eE+-]+)',    re.MULTILINE)
+TEMP_WALL_RE   = re.compile(r'^Wall time:\s+([\d.eE+-]+)\s+seconds',    re.MULTILINE)
+TEMP_WALK_RE   = re.compile(r'^Walk time:\s+([\d.eE+-]+)\s+seconds',    re.MULTILINE)
 
 
 def load_env(path: Path) -> dict:
@@ -183,8 +195,10 @@ def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt):
     if proc.returncode != 0:
         raise RuntimeError(f'tempest exit {proc.returncode}\nstderr tail:\n{proc.stderr[-500:]}')
     return {
-        'steps_per_sec': grab(TEMP_SPS_RE, 'Steps/sec',           proc.stdout),
-        'avg_walk_len':  grab(TEMP_AVL_RE, 'Average walk length', proc.stdout),
+        'steps_per_sec': grab(TEMP_SPS_RE,  'Steps/sec',           proc.stdout),
+        'avg_walk_len':  grab(TEMP_AVL_RE,  'Average walk length', proc.stdout),
+        'wall_sec':      grab(TEMP_WALL_RE, 'Wall time',           proc.stdout),
+        'walk_sec':      grab(TEMP_WALK_RE, 'Walk time',           proc.stdout),
     }
 
 
@@ -199,13 +213,21 @@ def run_tea(tea_bin, data_path, picker, variant, wpn, mwl, timescale, omp_thread
     if proc.returncode != 0:
         raise RuntimeError(f'tea exit {proc.returncode}\nstderr tail:\n{proc.stderr[-500:]}')
     return {
-        'steps_per_sec': grab(TEA_SPS_RE, 'Steps/sec',             proc.stdout),
-        'avg_walk_len':  grab(TEA_AVL_RE, 'Final avg walk length', proc.stdout),
+        'steps_per_sec': grab(TEA_SPS_RE,  'Steps/sec',             proc.stdout),
+        'avg_walk_len':  grab(TEA_AVL_RE,  'Final avg walk length', proc.stdout),
+        # TEA's reported walk-loop elapsed is compute-only (tight bracket
+        # around the OpenMP loop), so we treat it as walk_sec.  TEA has no
+        # equivalent wall_sec — set it equal to walk_sec so downstream code
+        # can treat the two engines uniformly.
+        'wall_sec':      grab(TEA_WALK_RE, 'Walks done elapsed',    proc.stdout),
+        'walk_sec':      grab(TEA_WALK_RE, 'Walks done elapsed',    proc.stdout),
     }
 
 
 def repeat(runs, label, runner, *runner_args):
-    sps = []
+    sps_list = []
+    walk_list = []
+    wall_list = []
     for i in range(1, runs + 1):
         print(f'    {label} run {i}/{runs} ...', end=' ', flush=True)
         try:
@@ -213,9 +235,17 @@ def repeat(runs, label, runner, *runner_args):
         except RuntimeError as e:
             print(f'FAIL ({str(e).splitlines()[0]})')
             continue
-        sps.append(r['steps_per_sec'])
-        print(f"sps={r['steps_per_sec']/1e6:6.2f}M  avg_len={r['avg_walk_len']:.2f}")
-    return sps
+        sps_list.append(r['steps_per_sec'])
+        walk_list.append(r['walk_sec'])
+        wall_list.append(r['wall_sec'])
+        print(f"sps={r['steps_per_sec']/1e6:6.2f}M  "
+              f"avg_len={r['avg_walk_len']:.2f}  "
+              f"wall={r['wall_sec']:.2f}s  walk={r['walk_sec']:.2f}s")
+    return {
+        'sps':  sps_list,
+        'walk': walk_list,
+        'wall': wall_list,
+    }
 
 
 def mean_std(xs):
@@ -304,23 +334,38 @@ def main() -> int:
         print()
 
     # ----- One summary table per Tempest KLT -----
+    # Steps/sec uses Walk time (compute-only) for both engines — apples-to-
+    # apples — and we also surface Wall time and Walk time means as
+    # diagnostic columns so the reader can see Tempest's setup overhead.
     def render_table(klt: str):
-        print('=' * 110)
-        print(f'Tempest [{klt}] vs TEA-reimpl — steps/sec (×10⁶), mean ± std  '
-              '(n/N suffix when partial cell)')
-        print('=' * 110)
+        print('=' * 138)
+        print(f'Tempest [{klt}] vs TEA-reimpl  '
+              '(Steps/sec computed against Walk time, the compute-only bracket; '
+              'mean ± std)')
+        print('=' * 138)
         print(f'| {"dataset":<14} | {"bias":<18} | '
-              f'{"Tempest (GPU)":>22} | {"TEA (CPU)":>22} | {"speedup":>14} |')
-        print('|' + '|'.join('-' * w for w in [16, 20, 24, 24, 16]) + '|')
+              f'{"Tempest sps (×10⁶)":>20} | {"TEA sps (×10⁶)":>20} | '
+              f'{"Tem wall (s)":>14} | {"Tem walk (s)":>14} | '
+              f'{"TEA walk (s)":>14} | {"speedup":>10} |')
+        print('|' + '|'.join('-' * w for w in
+                             [16, 20, 22, 22, 16, 16, 16, 12]) + '|')
         for ds in PRESETS:
             cell = results.get(ds)
             if cell is None:
-                print(f'| {ds:<14} | {"(skipped)":<18} |                        '
-                      f'|                        |                |')
+                print(f'| {ds:<14} | {"(skipped)":<18} |'
+                      + ' ' * 22 + '|' + ' ' * 22 + '|'
+                      + ' ' * 16 + '|' + ' ' * 16 + '|'
+                      + ' ' * 16 + '|' + ' ' * 12 + '|')
                 continue
             for bias_name, _, _ in BIAS_PICKERS:
-                tempest_sps_by_klt, a_sps = cell[bias_name]
-                t_sps = tempest_sps_by_klt.get(klt, [])
+                tempest_runs_by_klt, a_runs = cell[bias_name]
+                t = tempest_runs_by_klt.get(klt, {})
+                t_sps  = t.get('sps',  [])
+                t_wall = t.get('wall', [])
+                t_walk = t.get('walk', [])
+                a_sps  = a_runs['sps']
+                a_walk = a_runs['walk']
+
                 t_mu, t_sd = mean_std(t_sps)
                 a_mu, a_sd = mean_std(a_sps)
                 if t_mu == t_mu and a_mu == a_mu and t_mu > 0:
@@ -328,12 +373,26 @@ def main() -> int:
                     ratio_s = (f'{ratio:5.2f}× TEA' if ratio >= 1.0
                                else f'{1.0/ratio:5.2f}× Tem')
                 else:
-                    ratio_s = '         n/a'
+                    ratio_s = '       n/a'
+
+                t_wall_str = (f'{statistics.mean(t_wall):8.3f}'
+                              if t_wall else '     n/a')
+                t_walk_str = (f'{statistics.mean(t_walk):8.3f}'
+                              if t_walk else '     n/a')
+                a_walk_str = (f'{statistics.mean(a_walk):8.3f}'
+                              if a_walk else '     n/a')
+
                 print(f'| {ds:<14} | {bias_name:<18} | '
-                      f'{fmt_cell(t_mu, t_sd, len(t_sps), args.runs):>22} | '
-                      f'{fmt_cell(a_mu, a_sd, len(a_sps), args.runs):>22} | '
-                      f'{ratio_s:>14} |')
+                      f'{fmt_cell(t_mu, t_sd, len(t_sps), args.runs):>20} | '
+                      f'{fmt_cell(a_mu, a_sd, len(a_sps), args.runs):>20} | '
+                      f'{t_wall_str:>14} | {t_walk_str:>14} | '
+                      f'{a_walk_str:>14} | {ratio_s:>10} |')
         print()
+        print('  Wall = total wall-clock bracket inside the walk call '
+              '(setup + kernels + sync + D2H).')
+        print('  Walk = compute-only bracket (kernels + sync, after setup, '
+              'before D2H).  TEA has no separate wall; its own bracket is '
+              'already compute-only.')
         print('  "x.xx× TEA" = TEA faster; "x.xx× Tem" = Tempest faster.')
         print()
 
