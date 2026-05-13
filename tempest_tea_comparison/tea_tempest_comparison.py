@@ -2,12 +2,12 @@
 """
 Tempest (GPU) vs TEA-reimpl (CPU) side-by-side bulk comparison.
 
-Both engines run BACKWARD-IN-TIME walks so they sample from the same
-distribution (each picks the next edge with t < t_prev, favouring the
-most-recent past edge — closest-to-t_prev semantics, the natural
-"recent context" direction for representation-learning workloads).
-TEA-reimpl is backward-only by design; Tempest's walk_sampling_speed_test
-is invoked with walk_direction=Backward_In_Time.
+Both engines run FORWARD-IN-TIME walks so they sample from the same
+distribution that the TEA paper defines in §2.1 (Γ_t(u) = {t_i > t_prev},
+out-edges, t_i strictly increasing along the path).  TEA-reimpl is
+forward-only by design; Tempest's walk_sampling_speed_test is invoked
+with walk_direction=Forward_In_Time so the two engines walk in the same
+temporal direction over the same candidate edge set.
 
 Runs both engines on the five datasets registered in .env (growth,
 delicious, tgbl-comment, tgbl-flight, hub-synthetic) across three
@@ -46,9 +46,11 @@ Hardcoded module constants (edit this file to change them):
                               benchmarked under BOTH kernel-launch types;
                               the run prints one summary table per KLT so
                               the reader can pick the right scheduler.
-    TEMPEST_WALK_DIRECTION    Backward_In_Time — matches TEA-reimpl's
-                              hardwired backward-walk convention so the
-                              two engines sample the same distribution.
+    TEMPEST_WALK_DIRECTION    Forward_In_Time — matches TEA-reimpl's
+                              hardwired forward-walk convention (paper
+                              §2.1: t_i strictly increasing along the
+                              path) so the two engines sample the same
+                              distribution.
 """
 import argparse
 import os
@@ -146,11 +148,12 @@ TEMPEST_START_PICKER   = 'ExponentialWeight'     # walk_sampling_speed_test defa
 # best for the their workload.  NODE_GROUPED is Tempest's headline path;
 # FULL_WALK is the simpler per-walk dispatch the paper compares against.
 TEMPEST_KLTS           = ['FULL_WALK', 'NODE_GROUPED']
-# Walks go BACKWARD-IN-TIME in both engines.  TEA-reimpl is backward-only;
-# Tempest is told to run backward via this CLI arg.  Both engines then
-# favour edges with t < t_prev (closest-to-t_prev going backward = the
-# most-recent past edge), so the sampling distributions are aligned.
-TEMPEST_WALK_DIRECTION = 'Backward_In_Time'
+# Walks go FORWARD-IN-TIME in both engines.  TEA-reimpl is forward-only
+# (paper §2.1: Γ_t(u) = {t_i > t_prev}, out-edges, monotone-increasing
+# along the path).  Tempest is told to run forward via this CLI arg so
+# both engines sample from the same candidate-set definition and the
+# steps/sec comparison is apples-to-apples on the same algorithm.
+TEMPEST_WALK_DIRECTION = 'Forward_In_Time'
 
 # ---------------------------------------------------------------------------
 # stdout parsers
@@ -194,7 +197,7 @@ def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt,
         picker, TEMPEST_START_PICKER, klt,
         '',                      # walk_dump_file (empty = skip)
         str(timescale),
-        TEMPEST_WALK_DIRECTION,  # match TEA-reimpl's backward-only convention
+        TEMPEST_WALK_DIRECTION,  # match TEA-reimpl's forward-only convention
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -290,7 +293,7 @@ def main() -> int:
     print(f'Tempest KLTs  : {", ".join(TEMPEST_KLTS)}  '
           f'(reported in separate tables)')
     print(f'Tempest start picker: {TEMPEST_START_PICKER}')
-    print(f'walk direction: {TEMPEST_WALK_DIRECTION} (TEA-reimpl is backward-only)')
+    print(f'walk direction: {TEMPEST_WALK_DIRECTION} (TEA-reimpl is forward-only)')
     print(f'is_directed   : per-dataset — '
           + ', '.join(f'{ds}={d}' for ds, d in IS_DIRECTED.items()))
     print()
