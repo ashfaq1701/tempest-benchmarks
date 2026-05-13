@@ -42,10 +42,9 @@ Hardcoded module constants (edit this file to change them):
                               engines get the same per-dataset value, so
                               the comparison stays internally fair.
     TEMPEST_START_PICKER      walk_sampling_speed_test's default
-    TEMPEST_KLTS              ['FULL_WALK', 'NODE_GROUPED'] — Tempest is
-                              benchmarked under BOTH kernel-launch types;
-                              the run prints one summary table per KLT so
-                              the reader can pick the right scheduler.
+    TEMPEST_KLTS              ['NODE_GROUPED'] — Tempest's headline
+                              scheduler; the FULL_WALK per-walk dispatch
+                              is no longer benchmarked here.
     TEMPEST_WALK_DIRECTION    Forward_In_Time — matches TEA-reimpl's
                               hardwired forward-walk convention (paper
                               §2.1: t_i strictly increasing along the
@@ -143,11 +142,9 @@ IS_DIRECTED = {
     'hub-synthetic':  0,
 }
 TEMPEST_START_PICKER   = 'ExponentialWeight'     # walk_sampling_speed_test default
-# Tempest is benchmarked under BOTH kernel-launch types and reported in
-# two separate summary tables; the user can pick whichever scheduler is
-# best for the their workload.  NODE_GROUPED is Tempest's headline path;
-# FULL_WALK is the simpler per-walk dispatch the paper compares against.
-TEMPEST_KLTS           = ['FULL_WALK', 'NODE_GROUPED']
+# Tempest is benchmarked under its headline NODE_GROUPED scheduler only.
+# The simpler FULL_WALK per-walk dispatch is no longer reported here.
+TEMPEST_KLTS           = ['NODE_GROUPED']
 # Walks go FORWARD-IN-TIME in both engines.  TEA-reimpl is forward-only
 # (paper §2.1: Γ_t(u) = {t_i > t_prev}, out-edges, monotone-increasing
 # along the path).  Tempest is told to run forward via this CLI arg so
@@ -290,8 +287,7 @@ def main() -> int:
     print(f'TEA bin       : {TEA_BIN}')
     print(f'timescale_bound : {args.timescale_bound}   '
           f'OMP_NUM_THREADS: {args.omp_threads}   runs/cell: {args.runs}')
-    print(f'Tempest KLTs  : {", ".join(TEMPEST_KLTS)}  '
-          f'(reported in separate tables)')
+    print(f'Tempest KLT   : {", ".join(TEMPEST_KLTS)}')
     print(f'Tempest start picker: {TEMPEST_START_PICKER}')
     print(f'walk direction: {TEMPEST_WALK_DIRECTION} (TEA-reimpl is forward-only)')
     print(f'is_directed   : per-dataset — '
