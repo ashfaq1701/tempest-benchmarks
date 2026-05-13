@@ -9,23 +9,17 @@ publicly available, the only way to make the comparison defensible is
 to run our reimplementation under the paper's stated experimental
 config — exactly.  So the paper-defining parameters are hardcoded:
 
-    walks_per_node  = 10 for growth, 20 for delicious
-                                (paper §5.1 default is 10 (DeepWalk/CTDNE);
-                                 delicious is run at wpn=20 because its
-                                 walks die at avg length ≈ 2–3, so the
-                                 per-walk wall cost is tiny and we want
-                                 more samples to stabilise the median.
-                                 growth keeps the paper-default 10.)
+    walks_per_node  = 10        (DeepWalk/CTDNE default, paper §5.1)
     max_walk_len    = 80 for growth, 20 for delicious
                                 (paper §5.1 default is 80, but delicious
-                                 has 33.8M vertices: a 33.8M × 20 × 80 ×
-                                 16 B output buffer is ≈ 866 GB, which
+                                 has 33.8M vertices: a 33.8M × 10 × 80 ×
+                                 16 B output buffer is ≈ 433 GB, which
                                  OOMs any single-node box.  Walks on
                                  delicious die at avg length ≈ 2.16
                                  under exp-bias and ≈ 2.16 under linear
                                  anyway — mwl=20 is more than enough
                                  to never truncate a real walk, and the
-                                 output-buffer footprint drops to ~216 GB
+                                 output-buffer footprint drops to ~108 GB
                                  which fits a server.)
     timescale_bound = -1        (paper §2.3.II Eq 3: pure exp(t_i) with
                                  the t_cur cancellation, no rescale)
@@ -72,17 +66,17 @@ OMP_THREADS     = 16
 # and 3.1 under exp, so 80 is plenty of headroom; wpn=10 is the
 # DeepWalk/CTDNE default that the TEA paper §5.1 reports.
 #
-# delicious: wpn=20, mwl=20.  Walks die at avg length ≈ 2.16 under every
-# bias, so mwl=20 never truncates a real walk.  wpn=20 doubles the
-# samples vs. the paper default — its per-walk wall cost is tiny because
-# walks die so quickly, and the extra samples stabilise the median runtime.
-# walks_out buffer scales as num_walks × max_walk_len × sizeof(NodeStep);
-# 33.78M vertices × wpn=20 × mwl=20 × 16 B ≈ 216 GB, fits a server-class
-# box (paper Xeon had 94 GB DRAM — needs swap or a beefier server).
+# delicious: wpn=10, mwl=20.  wpn=10 stays at the paper default; mwl=20
+# is the only deviation, dictated by the output-buffer footprint.
+# Walks die at avg length ≈ 2.16 under every bias, so mwl=20 never
+# truncates a real walk.  walks_out buffer scales as num_walks ×
+# max_walk_len × sizeof(NodeStep); 33.78M vertices × wpn=10 × mwl=20 ×
+# 16 B ≈ 108 GB, fits a server-class box (the paper Xeon had 94 GB
+# DRAM — needs swap or a beefier server).
 DATASETS = (
     # (label, env-key, tea_variant, walks_per_node, max_walk_len)
     ('growth',    'GROWTH_PATH',    'tea_hpat', 10, 80),
-    ('delicious', 'DELICIOUS_PATH', 'tea_pat',  20, 20),
+    ('delicious', 'DELICIOUS_PATH', 'tea_pat',  10, 20),
 )
 
 # Bias name → tea_walk picker string.
