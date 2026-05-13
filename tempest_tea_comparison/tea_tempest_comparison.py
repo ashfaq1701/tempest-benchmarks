@@ -34,12 +34,13 @@ Hardcoded module constants (edit this file to change them):
     ENV_KEY                   per-dataset env-var name in .env
     TEA_VARIANT               per-dataset tea_walk variant (hpat / pat)
     BIAS_PICKERS              (display, Tempest enum, TEA enum) per bias
-    IS_DIRECTED               1 — these datasets are directed temporal
-                              interactions (user→item, sender→receiver).
-                              The TEA paper §2.1 doesn't actually specify
-                              direction (just defines G = (V, E, R)), so
-                              this is our judgement call, not a paper-
-                              required value.
+    IS_DIRECTED               per-dataset {ds: 0|1}.  growth, delicious,
+                              tgbl-* are directed temporal interactions
+                              (user→item, sender→receiver).  hub-synthetic
+                              is undirected by the generator's design
+                              (synthetic_data_generator/README.txt).  Both
+                              engines get the same per-dataset value, so
+                              the comparison stays internally fair.
     TEMPEST_START_PICKER      walk_sampling_speed_test's default
     TEMPEST_KLTS              ['FULL_WALK', 'NODE_GROUPED'] — Tempest is
                               benchmarked under BOTH kernel-launch types;
@@ -84,7 +85,10 @@ PRESETS = {
     'delicious':      ( 4, 10),   # max that fits within working-set budget
     'tgbl-comment':   (20, 80),
     'tgbl-flight':    (20, 80),
-    'hub-synthetic':  (50, 80),
+    # hub-synthetic: README's A40-recommended config (the dataset is sized
+    # for A40; laptop overflows at this wpn and would need (50, 80)).
+    # synthetic_data_generator/README.txt §"Walk config".
+    'hub-synthetic':  (500, 100),
 }
 
 # label → env-var key.
@@ -123,7 +127,19 @@ BIAS_PICKERS = [
 # data semantics and to stay consistent with tea_report_runtime.py
 # (which also uses 1 so the laptop figures across both scripts come
 # from the same edge interpretation).
-IS_DIRECTED            = 1
+# Per-dataset directionality.  growth, delicious, tgbl-* are directed
+# temporal interactions (user→item, sender→receiver).  hub-synthetic is
+# undirected by construction — the generator emits each hub-hub edge
+# without an implied direction, and the README's bench_synthetic harness
+# treats it that way.  Both engines get the same value per dataset so the
+# comparison stays internally fair.
+IS_DIRECTED = {
+    'growth':         1,
+    'delicious':      1,
+    'tgbl-comment':   1,
+    'tgbl-flight':    1,
+    'hub-synthetic':  0,
+}
 TEMPEST_START_PICKER   = 'ExponentialWeight'     # walk_sampling_speed_test default
 # Tempest is benchmarked under BOTH kernel-launch types and reported in
 # two separate summary tables; the user can pick whichever scheduler is
@@ -167,11 +183,12 @@ def first_existing(paths):
     return next((p for p in paths if p.is_file()), None)
 
 
-def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt):
+def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt,
+                is_directed):
     cmd = [
         str(tempest_bin), data_path,
         '1',                     # use_gpu
-        str(IS_DIRECTED),
+        str(is_directed),
         '-1',                    # num_total_walks (ignored when wpn != -1)
         str(wpn), str(mwl),
         picker, TEMPEST_START_PICKER, klt,
@@ -188,10 +205,11 @@ def run_tempest(tempest_bin, data_path, picker, wpn, mwl, timescale, klt):
     }
 
 
-def run_tea(tea_bin, data_path, picker, variant, wpn, mwl, timescale, omp_threads):
+def run_tea(tea_bin, data_path, picker, variant, wpn, mwl, timescale,
+            omp_threads, is_directed):
     cmd = [
         str(tea_bin), data_path, picker, variant,
-        str(IS_DIRECTED),
+        str(is_directed),
         str(wpn), str(mwl), str(timescale),
     ]
     env = {**os.environ, 'OMP_NUM_THREADS': str(omp_threads)}
@@ -273,7 +291,8 @@ def main() -> int:
           f'(reported in separate tables)')
     print(f'Tempest start picker: {TEMPEST_START_PICKER}')
     print(f'walk direction: {TEMPEST_WALK_DIRECTION} (TEA-reimpl is backward-only)')
-    print(f'is_directed   : {IS_DIRECTED}')
+    print(f'is_directed   : per-dataset — '
+          + ', '.join(f'{ds}={d}' for ds, d in IS_DIRECTED.items()))
     print()
 
     # results[ds][bias_name] = (tempest_sps_by_klt, tea_sps)
@@ -286,8 +305,10 @@ def main() -> int:
             print(f'  [skip] {ds}: {ENV_KEY[ds]} missing or path invalid ({data_path!r})')
             results[ds] = None
             continue
-        variant = TEA_VARIANT[ds]
-        print(f'--- {ds}  ({data_path})  wpn={wpn} mwl={mwl} variant={variant} ---')
+        variant     = TEA_VARIANT[ds]
+        is_directed = IS_DIRECTED[ds]
+        print(f'--- {ds}  ({data_path})  wpn={wpn} mwl={mwl} '
+              f'variant={variant} is_directed={is_directed} ---')
         results[ds] = {}
         for bias_name, tempest_picker, tea_picker in BIAS_PICKERS:
             print(f'  bias={bias_name}')
@@ -296,10 +317,11 @@ def main() -> int:
                 tempest_sps_by_klt[klt] = repeat(
                     args.runs, f'Tempest [{klt:<12}]', run_tempest,
                     tempest_bin, data_path, tempest_picker,
-                    wpn, mwl, args.timescale_bound, klt)
+                    wpn, mwl, args.timescale_bound, klt, is_directed)
             a_sps = repeat(args.runs, 'TEA    ', run_tea,
                            TEA_BIN, data_path, tea_picker, variant,
-                           wpn, mwl, args.timescale_bound, args.omp_threads)
+                           wpn, mwl, args.timescale_bound, args.omp_threads,
+                           is_directed)
             results[ds][bias_name] = (tempest_sps_by_klt, a_sps)
         print()
 
