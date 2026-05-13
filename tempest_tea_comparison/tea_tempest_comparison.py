@@ -145,12 +145,12 @@ TEMPEST_START_PICKER   = 'ExponentialWeight'     # walk_sampling_speed_test defa
 # Tempest is benchmarked under its headline NODE_GROUPED scheduler only.
 # The simpler FULL_WALK per-walk dispatch is no longer reported here.
 TEMPEST_KLTS           = ['NODE_GROUPED']
-# Walks go FORWARD-IN-TIME in both engines.  TEA-reimpl is forward-only
+# Walks go BACKWARD-IN-TIME in both engines.  TEA-reimpl is forward-only
 # (paper §2.1: Γ_t(u) = {t_i > t_prev}, out-edges, monotone-increasing
 # along the path).  Tempest is told to run forward via this CLI arg so
 # both engines sample from the same candidate-set definition and the
 # steps/sec comparison is apples-to-apples on the same algorithm.
-TEMPEST_WALK_DIRECTION = 'Forward_In_Time'
+TEMPEST_WALK_DIRECTION = 'Backward_In_Time'
 
 # ---------------------------------------------------------------------------
 # stdout parsers
