@@ -22,7 +22,15 @@ config — exactly.  So the paper-defining parameters are hardcoded:
                                  output-buffer footprint drops to ~108 GB
                                  which fits a server.)
     timescale_bound = -1        (paper §2.3.II Eq 3: pure exp(t_i) with
-                                 the t_cur cancellation, no rescale)
+                                 the t_cur cancellation, no rescale;
+                                 overridable via --timescale-bound for
+                                 sensitivity studies — note that any
+                                 positive value rescales the per-vertex
+                                 time range and shifts the exp/node2vec
+                                 distribution off the paper's spec, so
+                                 the ratio column for those two biases
+                                 stops being a strict reproduction.
+                                 Linear is unaffected by this knob.)
     is_directed     = 1         (paper §2.1 walk model is directed)
     omp_threads     = 16        (paper §5.1: 2× Xeon E5-2640 v2 = 16 cores;
                                  overridable via --omp-threads for runs on
@@ -32,9 +40,10 @@ config — exactly.  So the paper-defining parameters are hardcoded:
                                  becomes a cross-hardware figure rather
                                  than a like-for-like reproduction.)
 
-The other paper-config params have no CLI override — overriding them
-would invalidate the comparison.  CLI surfaces: --runs (measurement
-methodology), --env (env location), --omp-threads (hardware match).
+The remaining paper-config params have no CLI override — overriding
+them would invalidate the comparison.  CLI surfaces: --runs (measurement
+methodology), --env (env location), --omp-threads (hardware match),
+--timescale-bound (exp/node2vec distribution).
 
 Datasets, variants and biases are fixed: growth + delicious, the two
 in-memory rows of paper Table 4 that the laptop can run end-to-end.
@@ -57,12 +66,12 @@ ENV_DEFAULT = HERE / '.env'
 
 # ---------------------------------------------------------------------------
 # TEA paper §5.1 experimental config — hardcoded by design (see module docstring).
-# OMP thread count is overridable via --omp-threads; default matches the
-# paper's 16-core box.
+# OMP thread count and timescale_bound are overridable via CLI; defaults
+# match the paper (16 cores, no rescale).
 # ---------------------------------------------------------------------------
-TIMESCALE_BOUND     = -1.0
-IS_DIRECTED         = 1
-OMP_THREADS_DEFAULT = 16
+TIMESCALE_BOUND_DEFAULT = -1.0
+IS_DIRECTED             = 1
+OMP_THREADS_DEFAULT     = 16
 
 # Datasets: the two in-memory rows of paper Table 4 the laptop can run.
 # Each entry is (label, env-key, tea_variant, walks_per_node, max_walk_len).
@@ -124,13 +133,13 @@ def grab(rx: re.Pattern, tag: str, text: str) -> float:
 
 def run_tea(data_path: str, bias: str, variant: str,
             walks_per_node: int, max_walk_len: int,
-            omp_threads: int) -> dict:
+            timescale_bound: float, omp_threads: int) -> dict:
     cmd = [
         str(TEA_BIN), data_path, bias, variant,
         str(IS_DIRECTED),
         str(walks_per_node),
         str(max_walk_len),
-        str(TIMESCALE_BOUND),
+        str(timescale_bound),
     ]
     env = {**os.environ, 'OMP_NUM_THREADS': str(omp_threads)}
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
@@ -158,6 +167,15 @@ def main() -> int:
                          f'when the run host has a different core count; '
                          f'doing so makes the "ratio" column a cross-hardware '
                          f'figure rather than a like-for-like reproduction.')
+    ap.add_argument('--timescale-bound', type=float,
+                    default=TIMESCALE_BOUND_DEFAULT,
+                    help=f'exp-bias rescale passed to tea_walk. Default '
+                         f'{TIMESCALE_BOUND_DEFAULT} = paper §2.3.II Eq 3 '
+                         f'(pure exp(t_i), no rescale). Any positive value '
+                         f'rescales the per-vertex time range and shifts the '
+                         f'exp/node2vec distribution off paper spec — the '
+                         f'ratio column for those biases stops being a strict '
+                         f'reproduction (linear is unaffected).')
     args = ap.parse_args()
     if args.omp_threads <= 0:
         sys.stderr.write(f'ERROR: --omp-threads must be > 0 '
@@ -172,13 +190,16 @@ def main() -> int:
         return 1
     env = load_env(args.env)
 
-    omp_threads = args.omp_threads
+    omp_threads     = args.omp_threads
+    timescale_bound = args.timescale_bound
     omp_note = '' if omp_threads == OMP_THREADS_DEFAULT \
                   else f' (overridden; paper default = {OMP_THREADS_DEFAULT})'
+    ts_note  = '' if timescale_bound == TIMESCALE_BOUND_DEFAULT \
+                  else f' (overridden; paper default = {TIMESCALE_BOUND_DEFAULT})'
 
     print('=== TEA paper Table 4 reproduction ===')
     print(f'Binary    : {TEA_BIN}')
-    print(f'Fixed     : timescale_bound={TIMESCALE_BOUND}, '
+    print(f'Fixed     : timescale_bound={timescale_bound}{ts_note}, '
           f'is_directed={IS_DIRECTED}, '
           f'OMP_NUM_THREADS={omp_threads}{omp_note}')
     print(f'Per-ds    : ' + ', '.join(
@@ -201,7 +222,7 @@ def main() -> int:
                       end=' ', flush=True)
                 try:
                     r = run_tea(data_path, bias, variant, wpn, mwl,
-                                omp_threads)
+                                timescale_bound, omp_threads)
                 except RuntimeError as e:
                     print(f'FAIL ({e})')
                     continue
