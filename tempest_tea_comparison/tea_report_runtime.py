@@ -24,11 +24,17 @@ config — exactly.  So the paper-defining parameters are hardcoded:
     timescale_bound = -1        (paper §2.3.II Eq 3: pure exp(t_i) with
                                  the t_cur cancellation, no rescale)
     is_directed     = 1         (paper §2.1 walk model is directed)
-    omp_threads     = 16        (paper §5.1: 2× Xeon E5-2640 v2 = 16 cores)
+    omp_threads     = 16        (paper §5.1: 2× Xeon E5-2640 v2 = 16 cores;
+                                 overridable via --omp-threads for runs on
+                                 boxes with a different core count — note
+                                 that doing so moves the comparison off the
+                                 paper's hardware and the "ratio" column
+                                 becomes a cross-hardware figure rather
+                                 than a like-for-like reproduction.)
 
-There is no CLI override for any of these — overriding them would
-invalidate the comparison.  Only measurement methodology (--runs) and
-the env location (--env) are CLI surfaces.
+The other paper-config params have no CLI override — overriding them
+would invalidate the comparison.  CLI surfaces: --runs (measurement
+methodology), --env (env location), --omp-threads (hardware match).
 
 Datasets, variants and biases are fixed: growth + delicious, the two
 in-memory rows of paper Table 4 that the laptop can run end-to-end.
@@ -51,10 +57,12 @@ ENV_DEFAULT = HERE / '.env'
 
 # ---------------------------------------------------------------------------
 # TEA paper §5.1 experimental config — hardcoded by design (see module docstring).
+# OMP thread count is overridable via --omp-threads; default matches the
+# paper's 16-core box.
 # ---------------------------------------------------------------------------
-TIMESCALE_BOUND = -1.0
-IS_DIRECTED     = 1
-OMP_THREADS     = 16
+TIMESCALE_BOUND     = -1.0
+IS_DIRECTED         = 1
+OMP_THREADS_DEFAULT = 16
 
 # Datasets: the two in-memory rows of paper Table 4 the laptop can run.
 # Each entry is (label, env-key, tea_variant, walks_per_node, max_walk_len).
@@ -115,7 +123,8 @@ def grab(rx: re.Pattern, tag: str, text: str) -> float:
 
 
 def run_tea(data_path: str, bias: str, variant: str,
-            walks_per_node: int, max_walk_len: int) -> dict:
+            walks_per_node: int, max_walk_len: int,
+            omp_threads: int) -> dict:
     cmd = [
         str(TEA_BIN), data_path, bias, variant,
         str(IS_DIRECTED),
@@ -123,7 +132,7 @@ def run_tea(data_path: str, bias: str, variant: str,
         str(max_walk_len),
         str(TIMESCALE_BOUND),
     ]
-    env = {**os.environ, 'OMP_NUM_THREADS': str(OMP_THREADS)}
+    env = {**os.environ, 'OMP_NUM_THREADS': str(omp_threads)}
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f'tea_walk exit {proc.returncode}\nstderr tail:\n{proc.stderr[-500:]}')
@@ -142,7 +151,18 @@ def main() -> int:
     ap.add_argument('--runs', type=int, default=3,
                     help='runs per (dataset, bias) cell — stability measurement, '
                          'not a paper-config knob (default: 3)')
+    ap.add_argument('--omp-threads', type=int, default=OMP_THREADS_DEFAULT,
+                    help=f'OMP_NUM_THREADS for tea_walk. Default '
+                         f'{OMP_THREADS_DEFAULT} matches the TEA paper §5.1 '
+                         f'hardware (2× Xeon E5-2640 v2 = 16 cores). Override '
+                         f'when the run host has a different core count; '
+                         f'doing so makes the "ratio" column a cross-hardware '
+                         f'figure rather than a like-for-like reproduction.')
     args = ap.parse_args()
+    if args.omp_threads <= 0:
+        sys.stderr.write(f'ERROR: --omp-threads must be > 0 '
+                         f'(got {args.omp_threads})\n')
+        return 1
 
     if not TEA_BIN.is_file():
         sys.stderr.write(f'ERROR: TEA binary not found at {TEA_BIN}\n')
@@ -152,10 +172,15 @@ def main() -> int:
         return 1
     env = load_env(args.env)
 
+    omp_threads = args.omp_threads
+    omp_note = '' if omp_threads == OMP_THREADS_DEFAULT \
+                  else f' (overridden; paper default = {OMP_THREADS_DEFAULT})'
+
     print('=== TEA paper Table 4 reproduction ===')
     print(f'Binary    : {TEA_BIN}')
     print(f'Fixed     : timescale_bound={TIMESCALE_BOUND}, '
-          f'is_directed={IS_DIRECTED}, OMP_NUM_THREADS={OMP_THREADS}')
+          f'is_directed={IS_DIRECTED}, '
+          f'OMP_NUM_THREADS={omp_threads}{omp_note}')
     print(f'Per-ds    : ' + ', '.join(
         f'{ds}(wpn={wpn},mwl={mwl})' for ds, _, _, wpn, mwl in DATASETS))
     print(f'Runs/cell : {args.runs}')
@@ -175,7 +200,8 @@ def main() -> int:
                       f'run {run}/{args.runs} ...',
                       end=' ', flush=True)
                 try:
-                    r = run_tea(data_path, bias, variant, wpn, mwl)
+                    r = run_tea(data_path, bias, variant, wpn, mwl,
+                                omp_threads)
                 except RuntimeError as e:
                     print(f'FAIL ({e})')
                     continue
