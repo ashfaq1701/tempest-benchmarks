@@ -107,9 +107,19 @@ PAPER_TABLE4 = {
 
 # ---------------------------------------------------------------------------
 # stdout parsers (match tea_walk's print_run_stats format)
+#
+# tea_walk prints two timing figures per run:
+#   • Walks done: ...  (W s)            — wall time, Tempest-comparable
+#                                          (includes start-list build +
+#                                          output-buffer alloc + walk loop)
+#   • Walk loop time:  L s              — pure walk-loop time, the inner
+#                                          bracket around just run_walks_*
+# This report captures both.  Paper Table 4 numbers are wall-equivalent,
+# so the ratio column is computed against `walk_s` only.
 # ---------------------------------------------------------------------------
 WALK_TIME_RE = re.compile(r'^Walks done:\s+\d+\s+\(([\d.eE+-]+)\s+s\)',  re.MULTILINE)
 SPS_RE       = re.compile(r'^Steps/sec:\s+([\d.eE+-]+)\s+steps/sec',     re.MULTILINE)
+LOOP_TIME_RE = re.compile(r'^Walk loop time:\s+([\d.eE+-]+)\s+s',        re.MULTILINE)
 AVL_RE       = re.compile(r'^Final avg walk length:\s+([\d.eE+-]+)',     re.MULTILINE)
 
 
@@ -147,6 +157,7 @@ def run_tea(data_path: str, bias: str, variant: str,
         raise RuntimeError(f'tea_walk exit {proc.returncode}\nstderr tail:\n{proc.stderr[-500:]}')
     return {
         'walk_s':        grab(WALK_TIME_RE, 'Walks done',            proc.stdout),
+        'loop_s':        grab(LOOP_TIME_RE, 'Walk loop time',        proc.stdout),
         'steps_per_sec': grab(SPS_RE,       'Steps/sec',             proc.stdout),
         'avg_walk_len':  grab(AVL_RE,       'Final avg walk length', proc.stdout),
     }
@@ -207,6 +218,9 @@ def main() -> int:
     print(f'Runs/cell : {args.runs}')
     print()
 
+    # results[ds][bias] = {'wall': [...], 'loop': [...]} — parallel lists,
+    # one entry per successful run.  A failed run leaves both lists with
+    # one fewer entry than args.runs.
     results: dict = {ds: {} for ds, _, _, _, _ in DATASETS}
     for ds, env_key, variant, wpn, mwl in DATASETS:
         data_path = env.get(env_key)
@@ -214,7 +228,8 @@ def main() -> int:
             sys.stderr.write(f'ERROR: {ds} CSV not found ({env_key}={data_path!r})\n')
             return 1
         for bias in BIASES:
-            walk_times = []
+            wall_times: list = []
+            loop_times: list = []
             for run in range(1, args.runs + 1):
                 print(f'  {ds:9s} / {bias:18s} / {variant} / '
                       f'wpn={wpn:<2} mwl={mwl:<3} / '
@@ -226,36 +241,72 @@ def main() -> int:
                 except RuntimeError as e:
                     print(f'FAIL ({e})')
                     continue
-                walk_times.append(r['walk_s'])
-                print(f"walk={r['walk_s']:6.2f}s  "
+                wall_times.append(r['walk_s'])
+                loop_times.append(r['loop_s'])
+                print(f"wall={r['walk_s']:6.2f}s  "
+                      f"loop={r['loop_s']:6.2f}s  "
                       f"sps={r['steps_per_sec']/1e6:5.2f}M  "
                       f"avg_len={r['avg_walk_len']:.2f}")
-            results[ds][bias] = walk_times
+            results[ds][bias] = {'wall': wall_times, 'loop': loop_times}
 
     # ----- Side-by-side report -----
-    print()
-    print('=' * 78)
-    print('Paper Table 4 (TEA, in-memory) vs ours — wall time in seconds')
-    print('=' * 78)
-    print(f'| {"dataset":<10} | {"bias":<18} | '
-          f'{"paper":>7} | {"r1":>7} | {"r2":>7} | {"r3":>7} | '
-          f'{"median":>7} | {"ratio":>7} |')
-    print('|' + '|'.join('-' * w for w in [12, 20, 9, 9, 9, 9, 9, 9]) + '|')
-    for ds, _, _, _, _ in DATASETS:
-        for bias in BIASES:
-            paper  = PAPER_TABLE4[ds][bias]
-            runs   = results[ds].get(bias, [])
-            r_strs = [f'{x:7.2f}' for x in runs] + ['    n/a'] * 3
-            median = statistics.median(runs) if runs else float('nan')
-            ratio  = (median / paper) if runs else float('nan')
-            ratio_s = f'{ratio:6.2f}×' if runs else '    n/a'
-            print(f'| {ds:<10} | {bias:<18} | '
-                  f'{paper:>7.2f} | {r_strs[0]:>7} | {r_strs[1]:>7} | {r_strs[2]:>7} | '
-                  f'{median:>7.2f} | {ratio_s:>7} |')
+    # Two tables stacked: wall time (with paper-Table-4 ratio) + walk-loop
+    # time (no paper ratio — paper times are wall-equivalent, so comparing
+    # the inner-bracket loop time against them would be apples-to-oranges).
+    def print_table(kind: str, with_paper_ratio: bool) -> None:
+        print()
+        print('=' * 78)
+        if with_paper_ratio:
+            print('Paper Table 4 (TEA, in-memory) vs ours — '
+                  'wall time in seconds')
+        else:
+            print('Pure walk-loop time in seconds '
+                  '(inner bracket around run_walks_* only)')
+        print('=' * 78)
+        if with_paper_ratio:
+            header = (f'| {"dataset":<10} | {"bias":<18} | '
+                      f'{"paper":>7} | {"r1":>7} | {"r2":>7} | {"r3":>7} | '
+                      f'{"median":>7} | {"ratio":>7} |')
+            sep_widths = [12, 20, 9, 9, 9, 9, 9, 9]
+        else:
+            header = (f'| {"dataset":<10} | {"bias":<18} | '
+                      f'{"r1":>7} | {"r2":>7} | {"r3":>7} | '
+                      f'{"median":>7} |')
+            sep_widths = [12, 20, 9, 9, 9, 9]
+        print(header)
+        print('|' + '|'.join('-' * w for w in sep_widths) + '|')
+        for ds, _, _, _, _ in DATASETS:
+            for bias in BIASES:
+                cell = results[ds].get(bias, {'wall': [], 'loop': []})
+                runs = cell[kind]
+                r_strs = [f'{x:7.2f}' for x in runs] + ['    n/a'] * 3
+                median = statistics.median(runs) if runs else float('nan')
+                if with_paper_ratio:
+                    paper   = PAPER_TABLE4[ds][bias]
+                    ratio   = (median / paper) if runs else float('nan')
+                    ratio_s = f'{ratio:6.2f}×' if runs else '    n/a'
+                    print(f'| {ds:<10} | {bias:<18} | '
+                          f'{paper:>7.2f} | {r_strs[0]:>7} | {r_strs[1]:>7} | '
+                          f'{r_strs[2]:>7} | {median:>7.2f} | {ratio_s:>7} |')
+                else:
+                    print(f'| {ds:<10} | {bias:<18} | '
+                          f'{r_strs[0]:>7} | {r_strs[1]:>7} | {r_strs[2]:>7} | '
+                          f'{median:>7.2f} |')
+
+    print_table('wall', with_paper_ratio=True)
     print()
     print('  paper  = TEA paper Table 4 (their hardware: 2× Xeon E5-2640 v2,')
     print('           16 cores total, 94 GB DRAM).')
     print('  ratio  = ours_median / paper.  >1 means ours is slower; <1 faster.')
+    print('  wall   = Tempest-comparable bracket: start-list build + output')
+    print('           buffer alloc + the OpenMP walk loop.')
+
+    print_table('loop', with_paper_ratio=False)
+    print()
+    print('  loop   = pure walk-loop time: inner bracket around just the')
+    print('           run_walks_* call (no start-list build, no buffer alloc).')
+    print('           Use this column to compare TEA against engines that')
+    print('           also report a pure-walker bracket.')
     return 0
 
 
